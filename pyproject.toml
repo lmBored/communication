@@ -1,16 +1,25 @@
 [build-system]
-requires = []
-build-backend = "madrona-py-build"
-backend-path = ["external/madrona/py"]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "madrona_escape_room"
-version = "0.0.1"
+name = "escape_room"
+version = "0.1.0"
+description = "Multi-agent cooperative puzzle environment powered by mjlab + mjwarp + rsl-rl"
+requires-python = ">=3.10"
+dependencies = [
+    "mjlab>=1.6.0,<1.7",
+]
 
-[tool.madrona.packages.madrona_escape_room]
-ext-only = true
-ext-out-dir = "build"
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
 
-# This module includes the PPO implementation for the training demo
-[tool.madrona.packages.madrona_escape_room_learn]
-path = "train_src/madrona_escape_room_learn"
+[project.scripts]
+escape-room-train = "escape_room.train:main"
+escape-room-play = "escape_room.play:main"
+
+[tool.setuptools.packages.find]
+include = ["escape_room*"]
