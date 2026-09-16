@@ -1,155 +1,189 @@
-Madrona Escape Room
-============================
+# Escape Room
 
-This is an example RL environment simulator built on the [Madrona Engine](https://madrona-engine.github.io). 
-The goal of this repository is to provide a simple reference that demonstrates how to use Madrona's ECS APIs and 
-how to interface with the engine's rigid body physics and rendering functionality.
-This example also demonstrates how to integrate the simulator with python code for evaluating agent polices and/or policy learning. Specifically, this codebase includes a simple PyTorch PPO training loop integrated with the simulator that can train agents in under an hour on a high end GPU.
+Multi-agent cooperative puzzle environment running on **mjlab + MuJoCo Warp** with continuous controls, procedural rooms, 3D playback, and **rsl-rl PPO** training.
 
-If you're interested in using Madrona to implement a high-performance batch simulator for a new environment or RL training task, we highly recommend forking this repo and adding/removing code as needed, rather than starting from scratch. This will ensure the build system and backends are setup correctly.
+## Overview
 
-The Environment and Learning Task
---------------
+Two agents navigate through 3 procedural rooms, solving puzzles involving buttons, doors, and cubes to maximize progress:
 
-https://github.com/shacklettbp/madrona_escape_room/assets/1111429/ec6231c8-a74b-4f0a-8a1a-b1bcdc7111cd
+- **2 agents** with continuous controls (move, yaw, grab)
+- **3 procedural rooms** (SingleButton, DoubleButton, CubeBlocking, CubeButtons)
+- **Buttons & doors** that require cooperation
+- **Physical cube grab** using a forward ray, exclusive attachment, carried motion, and toggle release
+- **Egocentric + lidar-style observations**
+- **Progress-based rewards** with partner bonus
 
-As shown above, the simulator implements a 3D environment consisting of two agents and a row of three rooms. All agents start in the first room, and must navigate to as many new rooms as possible. The agents must step on buttons or push movable blocks over buttons to trigger the opening of doors that lead to new rooms. Agents are rewarded based on their progress along the length of the level.
+## Installation
 
-The codebase trains a shared policy that controls agents individually with direct engine inputs rather than pixel observations. Agents interact with the simulator as follows:
-
-**Action Space:**
- * Movement amount: Egocentric polar coordinates for the direction and amount to move, translated to XY forces in the physics engine.
- * Rotation amount: Torque applied to the agent to turn.
- * Grab: Boolean, true to grab if possible or release if already holding an object.
-
-**Observation Space:**
- * Global position.
- * Position within the current room.
- * Distance and direction to all the buttons and cubes in the current room (egocentric polar coordinates).
- * 30 Lidar samples arrayed in a circle around the agent, giving distance to the nearest object along a direction.
- * Whether the current room's door is open (boolean).
- * Whether an object is currently grabbed (boolean).
- * The max distance achieved so far in the level.
- * The number of steps remaining in the episode.
-
-**Rewards:**
-  Agents are rewarded for the max distance achieved along the Y axis (the length of the level). Each step, new reward is assigned if the agents have progressed further in the level, or a small penalty reward is assigned if not.
- 
-For specific details about the format of observations, refer to exported ECS components introduced in the [code walkthrough section](#simulator-code-walkthrough-learning-the-madrona-ecs-apis). 
-
-Overall the "full simulator" contains logic for three major concerns:
-* Procedurally generating a new random level for each episode.
-* Time stepping the environment, which includes executing rigid body physics and evaluating game logic in response to agent actions.
-* Generating agent observations from the state of the environment, which are communicated as PyTorch tensors to external policy evaluation or learning code.
-
-Build Instructions
---------
-First, make sure you have all the dependencies listed [here](https://github.com/shacklettbp/madrona#dependencies) (briefly, recent python and cmake, as well as Xcode or Visual Studio on MacOS or Windows respectively).
-
-To build the simulator with visualization support on Linux (`build/viewer`), you also need to install X11 and OpenGL development libraries. Equivalent dependencies should already be installed by Xcode on MacOS.
-For example, on Ubuntu:
 ```bash
-sudo apt install libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev mesa-common-dev
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+# ffmpeg must be on PATH to record MP4s (e.g. brew install ffmpeg)
 ```
 
-The built-in training functionality requires [PyTorch 2.0](https://pytorch.org/get-started/locally/) or later as well.
+Or with uv:
 
-Now that you have the required dependencies, fetch the repo (don't forget `--recursive`!):
 ```bash
-git clone --recursive https://github.com/shacklettbp/madrona_escape_room.git
-cd madrona_escape_room
+uv sync
 ```
 
-Next, for Linux and MacOS: Run `cmake` and then `make` to build the simulator:
+## Usage
+
+### Training (headless mjwarp + rsl-rl)
+
 ```bash
-mkdir build
-cd build
-cmake ..
-make -j # cores to build with
-cd ..
+escape-room-train --num-envs 32768 --num-updates 50 --physics-substeps 1 --ckpt-dir ./ckpts --device cuda:0
+
+# equivalent, from a source checkout without installing
+python scripts/train.py --num-envs 32768 --num-updates 50 --physics-substeps 1 --ckpt-dir ./ckpts --device cuda:0
 ```
 
-Or on Windows, open the cloned repository in Visual Studio and build
-the project using the integrated `cmake` functionality.
+The final `trainer_env_SPS` and `trainer_agent_SPS` values use the complete `runner.learn(...)` wall time: policy inference, MuJoCo-Warp rollout, PPO optimization, and logging. `scripts/sim_bench.py` is the separate rollout-only microbenchmark; its `rollout_only_*` figures are not trainer SPS. The default uses the original environment's single 0.04 s physics step; increase `--physics-substeps` for integration-sensitive experiments at a roughly proportional simulation cost. Use `--check-nans` only when debugging because rsl-rl's per-transition checks synchronize the GPU. The Gaussian policy learns log standard deviation so PPO cannot drive the exploration scale through zero; playback still detects and loads older scalar-standard-deviation checkpoints.
 
+The game systems run as four fused MuJoCo-Warp kernels (`escape_room/warp_game.py`) launched beside the physics kernels over the same batched state: one pre-step kernel publishes cube poses and updates buttons, doors, and grab; one apply kernel drives agents, carries held cubes, and slides the doors; one reward kernel folds progress, partner bonus, and slack together; and one observation kernel writes the complete 188-value vector per world straight into a persistent buffer. That replaces roughly two hundred small eager launches and the per-step temporaries and concatenations they needed. `--game-backend torch` keeps the equivalent eager PyTorch implementation for debugging and parity tests. Headless training additionally uses a specialized synchronous step: root poses are read directly from post-integration `qpos`, the unused sensor/forward graph is skipped, synchronous timeout reset avoids a per-step dynamic `nonzero`, and the single action/observation term bypasses redundant manager copies. Interactive and recorded 3D playback retain mjlab's generic refresh path.
 
-Now, setup the python components of the repository with `pip`:
+The scene allocates only the cube bodies the level recipes can actually use. `generate_level` produces a fixed room sequence that needs `5` cubes, so `--cube-layout fixed` (the default) allocates `5` free bodies instead of the previous `12`, of which `7` were always parked and inactive. `--cube-layout recipe` allocates the `9` that cover every room type if the sequence is randomized, and `--cube-layout legacy` restores the original `12`; the level pool validates at construction that every cube a recipe activates has a body, so an unsupported combination fails with an actionable error instead of silently dropping cubes.
+
+The profiled performance default of `32768` environments, `16` rollout steps, and `1` physics substep leaves about `26 GiB` free on a 40 GiB A100. A 32-step rollout reached only 1% higher SPS, so 16 remains the default. Contact/constraint buffers are sized to the measured escape-room workload (`48`/`192` per world): a 400-step rollout at 32768 worlds used `757,944` of `1,572,864` contact slots and `104` of `6,291,456` constraint rows, so the buffers keep a `2.07×` contact margin while measuring `6.7%` faster than the previous `96`/`384`. Inactive cubes start outside the finite floor instead of generating artificial contacts. GPU memory scales primarily with `--num-envs`; rsl-rl rollout storage also scales with `--num-envs × --steps-per-update`. If a run reports OOM, reduce `--num-envs` first.
+
+End-to-end training measured on Snellius A100-SXM4-40GB with 30 updates:
+
+| Configuration | Trainer env SPS | Trainer agent SPS |
+|---|---:|---:|
+| Job `26753440`: 512 envs, 8 substeps, duplicate observations/checks | 9,311 | 18,622 |
+| Job `26754193`: 512 envs, 2 substeps, optimized observations/checks | 20,459 | 40,918 |
+| Job `26754414`: 1024 envs, 2 substeps, log-std policy | 36,897 | 73,795 |
+| Job `26759546`: 1024 envs, 1 substep, optimized scene/game path | 40,819 | 81,638 |
+| Job `26774800`: 8192 envs, batched/vectorized game layer | 268,161 | 536,322 |
+| Job `26780690`: 32768 envs, specialized synchronous step | 691,735 | 1,383,470 |
+| Job `26786209`: 5 cube bodies instead of 12 | 924,791 | 1,849,583 |
+| Job `26786763`: fused Warp game/observation kernels | 1,133,082 | 2,266,165 |
+| Job `26788126`: `48`/`192` contact/constraint buffers | **1,159,995** | **2,319,990** |
+
+Rollout-only figures at 32768 worlds (simulation only, no PPO), measured with `--repeats 3` and reported as the median: raw escape-room physics `1,707,956` env SPS and the full specialized step `1,484,447` env SPS, which is 87% of raw-physics throughput. At 8192 worlds the same build reaches `1,445,150` raw and `1,147,058` full-step env SPS. Synchronized per-phase timing of the full step at 32768 worlds attributes `95.2%` of it to physics (`22.1 ms`), with the four fused game kernels, reward, and observation together under `1.2 ms`; per-phase synchronization inflates the physics share somewhat, so treat it as indicative.
+
+The earlier near-million figure came from `EscapeRoomVecEnv`, the tensor-only kinematic fallback (`878,830` rollout-only env SPS), not MuJoCo-Warp or end-to-end PPO; the real 35-body/34-geom MuJoCo-Warp scene now beats it in both rollout-only and end-to-end training. The CRAX state-only 800k result is still not directly comparable: that path uses JAX/MJX for physics and a fused JIT training loop, and MuJoCo Warp is used only by its optional pixel renderer. `--base-step` restores mjlab's generic step for profiling.
+
+#### Measured and rejected
+
+Every candidate below was implemented or configured and benchmarked on the same A100; none survived, and the reasons are recorded so they are not retried blindly.
+
+| Candidate | Measurement | Outcome |
+|---|---|---|
+| Shared actor/critic observation preprocessing (one normalizer, no single-group concat) | `1,111,260` vs `1,117,644` trainer env SPS | Dropped: inside the 0.8% run spread, and it patched rsl-rl internals |
+| Fused reset writes | An all-world reset costs about one env step (`1,065,575` vs `1,149,564` equivalent env SPS), i.e. ≈0.5% of wall time at one reset per 200 steps | Not implemented: unmeasurable at any realistic episode length |
+| `torch.compile` on the observation math | No measured gain in earlier jobs | Removed together with the `--compile-game` flag |
+| `sap_tile` broadphase | `1,367,786` vs `1,391,067` env SPS | Rejected: 1.7% slower |
+| `sap_segmented` broadphase | `950,990` env SPS | Rejected: 32% slower |
+| `--solver-iterations 4 --solver-ls-iterations 2` | `1,529,162` env SPS (+9.9%) | Kept as an opt-in flag only: it trades contact accuracy in a game built around pushing and carrying cubes |
+
+#### Comparison with the original Madrona repository
+
+Snellius job `26787852` cloned upstream commit `21f674951c68888045c824b5b981e158975f9e90` (Madrona submodule `b46e6ab782cfd06956c35cb2ae42351a3fb5f38c`) into a separate directory and built its original CUDA stack on the same A100-SXM4-40GB allocation. Both implementations used `32768` worlds, `16` rollout steps per update, a `0.04 s` control step, two agents, and 200-step episodes.
+
+| Implementation | Rollout-only env SPS | End-to-end trainer env SPS |
+|---|---:|---:|
+| Original Madrona + custom PPO | 862,641 | 591,215 average |
+| Current mjwarp + rsl-rl (job `26788126`) | **1,484,447** | **1,159,995** |
+
+The current stack is now about `1.72×` faster in the isolated rollout benchmark and `1.96×` faster end-to-end, reversing the earlier result where Madrona's simulator led by `13.2%`. The original's own callback reported `0.696 s` rollout and `0.203 s` PPO time per update. This remains a workload-level comparison rather than identical numerical physics or policy learning: the original uses discrete action heads, `4` physics substeps, and custom PPO, while this refactor uses continuous actions, MuJoCo contact dynamics, one `0.04 s` step, and rsl-rl. Reproduce it with `sbatch hpc/compare_original.sbatch`; the legacy upstream runtime requires CUDA 12.4 on the current Snellius software stack. Note that the current-side figures quoted here come from job `26788126` because job `26787852` picked up a mid-run code sync for its own current-stack stages.
+
+For Snellius, `./asdf.sh` submits those defaults. Override them explicitly when profiling a different GPU or workload:
+
 ```bash
-pip install -e . # Add -Cpackages.madrona_escape_room.ext-out-dir=PATH_TO_YOUR_BUILD_DIR on Windows
+NUM_ENVS=32768 STEPS_PER_UPDATE=16 NUM_UPDATES=30 PHYSICS_SUBSTEPS=1 ./asdf.sh
 ```
 
-You can then view the environment by running:
 ```bash
-./build/viewer
+# rollout-only simulation throughput (MuJoCo Warp physics, no PPO updates)
+python scripts/sim_bench.py --backend mjlab --num-envs 8192 --num-steps 200 --step-mode full
+
+# compare mjlab's generic forward/sense step
+python scripts/sim_bench.py --backend mjlab --num-envs 8192 --num-steps 200 --step-mode full --base-step
+
+# raw physics only, same scene
+python scripts/sim_bench.py --backend mjlab --num-envs 8192 --num-steps 200 --step-mode physics
+
+# per-phase attribution of one full step, plus contact/constraint usage
+python scripts/sim_bench.py --backend mjlab --num-envs 8192 --num-steps 200 --step-mode phases
+
+# cost of an all-world reset, in the same env-SPS units as a step
+python scripts/sim_bench.py --backend mjlab --num-envs 8192 --num-steps 200 --step-mode reset
+
+# A/B a candidate: eager game systems, or the original 12-cube scene
+python scripts/sim_bench.py --backend mjlab --num-envs 8192 --num-steps 200 --repeats 3 --game-backend torch
+python scripts/sim_bench.py --backend mjlab --num-envs 8192 --num-steps 200 --repeats 3 --cube-layout legacy
+
+# same mjwarp/mjlab stack with a canonical simple scene
+python scripts/sim_bench.py --backend cartpole --num-envs 8192 --num-steps 200
+
+# matched end-to-end rsl-rl baseline on that simple scene
+python scripts/train.py --task cartpole --num-envs 8192 --num-updates 30
 ```
 
-Or test the PyTorch training integration:
+### Play / demo (live window)
+
 ```bash
-python scripts/train.py --num-worlds 1024 --num-updates 100 --ckpt-dir build/ckpts
+# Heuristic demo (no checkpoint needed) — opens the MuJoCo 3D viewer
+escape-room-play
+
+# Random agents
+escape-room-play --policy random
+
+# Trained rsl-rl checkpoint
+escape-room-play --ckpt ./ckpts/model_49.pt
 ```
 
-Simulator Code Walkthrough (Learning the Madrona ECS APIs)
------------------------------------------------------------
+### Record video
 
-As mentioned above, this repo is intended to serve as a tutorial for how to use Madrona to implement a batch simulator for a simple 3D environment. If you're not interested in implementing your own novel environment simulator in Madrona and just want to try training agents, [skip to the next section](#training-agents).
-
-We assume the reader is familiar with the key concepts of the entity component system (ECS) design pattern.  If you are unfamiliar with ECS concepts, we recommend that you check out Sander Mertens' very useful [Entity Components FAQ](https://github.com/SanderMertens/ecs-faq). 
-
-#### Defining the Simulation's State: Components and Archetypes ####
-
-The first step to understanding the simulator's implementation is to understand the ECS components that make up the data in the simulation. All the custom logic in the simulation (as well as logic for built-in systems like physics) is written in terms of these data types. Take a look at [`src/types.hpp`](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/types.hpp#L28). This file first defines all the ECS components as simple C++ structs and next declares the ECS archetypes in terms of the components they are composed of. For integration with learning, many of the components of the `Agent` archetype are directly exported as PyTorch tensors. For example, the `Action` component directly correspondes to the action space described above, and `RoomEntityObservations` is the agent observations of all the objects in each room.
-
-#### Defining the Simulation's Logic: Systems and the Task Graph ####
-
-After understanding the ECS components that make up the data of the simulation, the next step is to learn about the ECS systems that operate on these components and implement the custom logic of the simulation. Madrona simulators define a centralized task graph that declares all the systems that need to execute during each simulation step that the Madrona runtime then executes across all the unique worlds in a simulation batch simultaneously for each step. This codebase builds the task graph during initialization in the [`Sim::setupTasks`](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/sim.cpp#L552) function using `TaskGraphBuilder` class provided by Madrona. Take note of all the ECS system functions that `setupTasks` enqueues in the task graph using `ParallelForNode<>` nodes, and match the component types to the components declared you viewed in [`types.hpp`](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/types.hpp). For example, `movementSystem`, added at the beginning of the task graph, implements the custom logic that translates discrete agent actions from the `Action` component into forces for the physics engine. At the end of each step, `collectObservationSystem` reads the simulation state and builds observations for the agent policy.
-
-At this point for an overview of the whole simulator you can continue to the next section, or for further details, you can continue reading [`src/sim.cpp`](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/sim.cpp) and ['src/sim.hpp](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/sim.hpp) where all the core simulation logic is located with the exception of level generation logic that handles creating new entities and placing them. The level generation logic starts with the [`generateWorld`](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/level_gen.cpp#L558) function in [`src/level_gen.cpp`](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/level_gen.cpp) and is called for each world when a training episode ends.
-
-#### Initializing the Simulator and Interfacing with Python Training Code ####
-
-The final missing pieces of the simulator are how the Madrona backends are initialized and how data communication between PyTorch and the simulator is managed. These pieces are controlled by the `Manager` class in [`src/mgr.hpp`](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/mgr.hpp) and [`src/mgr.cpp`](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/mgr.cpp). During initialization, the `Manager` constructor is passed an `ExecMode` object from pytorch that dictates whether the CPU or CUDA backends should be initialized. The `Manager` class then loads physics assets off disk (copying them to the GPU if needed) and then initializes the appropriate backend. Once initialization is complete, the python code can access simulation state through the `Manager`'s exported PyTorch tensors (for example, `Manager::rewardTensor`) via the python bindings declared in [`src/bindings.cpp`](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/mgr.cpp). These bindings are just a thin wrapper around the `Manager` class using [`nanobind`](https://github.com/wjakob/nanobind).
-
-#### Visualizing Simulation Output ####
-
-The code that integrates with our visualization infrastructure is located in [`src/viewer.cpp`](https://github.com/shacklettbp/madrona_escape_room/blob/main/src/viewer.cpp). This code links with the `Manager` class and produces the `viewer` binary in the build directory that lets you control the agents directly and replay actions. More customization in the viewer code to support custom UI and overlays will be supported in the future.
-
-Training Agents 
---------------------------------
-
-In addition to the simulator itself, this repo contains a simple PPO implementation (in PyTorch) to demonstrate how to integrate a training codebase with a Madrona batch simulator. [`scripts/train.py`](https://github.com/shacklettbp/madrona_escape_room/blob/main/scripts/train.py) is the training code entry point, while the bulk of the PPO implementation is in [train_src/madrona_escape_room_learn](https://github.com/shacklettbp/madrona_escape_room/blob/main/train_src/madrona_escape_room_learn). 
-
-For example, the following settings will produce agents that should be able to solve all three rooms fairly consistently:
 ```bash
-python scripts/train.py --num-worlds 8192 --num-updates 5000 --profile-report --fp16 --gpu-sim --ckpt-dir build/checkpoints/
+# MuJoCo offscreen rendering (servers / CI)
+escape-room-play --headless --policy heuristic --record demos/escape_demo.mp4 --steps 400
+
+# rsl-rl checkpoint rollout to video
+escape-room-play --headless --ckpt ./ckpts/model_49.pt --record demos/policy.mp4 --steps 400
 ```
 
-If your machine doesn't support the GPU backend, simply remove the `--gpu-sim` argument above and consider reducing the `--num-worlds` argument to reduce the batch size. 
+Without a desktop display, the interactive command starts mjlab's Viser 3D viewer and prints its browser URL. `ffmpeg` must be on `PATH` for MP4 output.
+On macOS, the regular `python scripts/play.py ...` command automatically restarts itself with MuJoCo's required `mjpython` launcher before opening the native 3D viewer.
 
-After 5000 updates, the policy should have finished training. You can run the policy and record a set of actions with:
-```bash
-python scripts/infer.py --num-worlds 1 --num-steps 1000 --fp16 --ckpt-path build/checkpoints/5000.pth --action-dump-path build/dumped_actions
-```
-
-Finally, you can replay these actions in the `viewer` program to see how your agents behave:
-```bash
-./build/viewer 1 --cpu build/dumped_actions
-```
-
-Hold down right click and use WASD to fly around the environment, or use controls in the UI to following a viewer in first-person mode. Hopefully your agents perform similarly to those in the video at the start of this README!
-
-Note that the hyperparameters chosen in scripts/train.py are likely non-optimal. Let us know if you find ones that train faster.
-
-Citation
---------
-If you use Madrona in a research project, please cite our SIGGRAPH paper.
+## Architecture
 
 ```
-@article{shacklett23madrona,
-    title   = {An Extensible, Data-Oriented Architecture for High-Performance, Many-World Simulation},
-    author  = {Brennan Shacklett and Luc Guy Rosenzweig and Zhiqiang Xie and Bidipta Sarkar and Andrew Szot and Erik Wijmans and Vladlen Koltun and Dhruv Batra and Kayvon Fatahalian},
-    journal = {ACM Trans. Graph.},
-    volume  = {42},
-    number  = {4},
-    year    = {2023}
-}
+escape_room/
+  consts.py            # Caps / rewards / obs dims
+  level_gen.py         # Procedural room recipes
+  scene.py             # Fixed-topology MuJoCo entity composition
+  warp_game.py         # Fused Warp game/observation kernels (default backend)
+  mjlab_env.py         # Physical game/action term and MDP providers
+  env_cfg.py / env.py  # mjlab and rsl-rl configuration/construction
+  train.py             # rsl-rl PPO and trainer-inclusive SPS (escape-room-train)
+  play.py              # Native/Viser 3D viewer + MuJoCo MP4 (escape-room-play)
+  vec_env.py           # Isolated kinematic microbenchmark fallback
+scripts/
+  train.py / play.py   # Thin wrappers for source checkouts
+  sim_bench.py         # Rollout-only simulation benchmark
+hpc/
+  comm.sbatch          # Snellius short-training + benchmark job
+  optbench.sbatch      # A/B harness: one allocation, many variants
+  compare_original.sbatch  # Upstream Madrona head-to-head
 ```
+
+## Differences from Original Madrona Version
+
+- **Continuous actions** instead of discrete buckets
+- **Pure Python** packaging (no CMake/Madrona build required for the new path)
+- Training uses **rsl-rl** through mjlab's `MjlabOnPolicyRunner`
+- **No old checkpoint compatibility** (action space changed)
+- Playback is **real MuJoCo 3D** rather than the old Madrona renderer
+
+## Requirements
+
+- Python >= 3.10 and `mjlab>=1.6,<1.7`
+- NVIDIA GPU required for high-throughput mjwarp training; CPU is supported for light playback/tests
+- `ffmpeg` on PATH to write MP4s
+
+## License
+
+Same as original Madrona Escape Room (see LICENSE).
