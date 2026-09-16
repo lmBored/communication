@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import torch
 
 from mjlab.managers.action_manager import ActionTerm, ActionTermCfg
+from mjlab.utils.lab_api.math import quat_apply_inverse
 
 from escape_room.consts import (
     ACTION_DIM_PER_AGENT,
@@ -58,12 +59,116 @@ def _quat_from_yaw(yaw: torch.Tensor) -> torch.Tensor:
     return quat
 
 
+def _lidar_impl(
+    origin: torch.Tensor, yaw: torch.Tensor, lidar_beam: torch.Tensor
+) -> torch.Tensor:
+    angle = yaw[..., None] + lidar_beam
+    direction = torch.stack((torch.cos(angle), torch.sin(angle)), dim=-1)
+    eps = 1.0e-6
+    tx_pos = ((WORLD_WIDTH * 0.5) - origin[..., 0, None]) / direction[
+        ..., 0
+    ].clamp_min(eps)
+    tx_neg = ((-WORLD_WIDTH * 0.5) - origin[..., 0, None]) / direction[
+        ..., 0
+    ].clamp_max(-eps)
+    ty_pos = (WORLD_LENGTH - origin[..., 1, None]) / direction[..., 1].clamp_min(eps)
+    ty_neg = (0.0 - origin[..., 1, None]) / direction[..., 1].clamp_max(-eps)
+    candidates = torch.stack((tx_pos, tx_neg, ty_pos, ty_neg), dim=-1)
+    candidates = torch.where(
+        candidates > 0.0, candidates, torch.full_like(candidates, float("inf"))
+    )
+    depth = candidates.min(-1).values.clamp(max=LIDAR_MAX_RANGE) / LIDAR_MAX_RANGE
+    hit_type = torch.full_like(
+        depth, float(EntityType.WALL) / float(EntityType.NUM_TYPES)
+    )
+    return torch.stack((depth, hit_type), dim=-1).flatten(2)
+
+
+def _observation_impl(
+    agent_pos: torch.Tensor,
+    yaw: torch.Tensor,
+    entity_pos: torch.Tensor,
+    entity_type: torch.Tensor,
+    entity_active: torch.Tensor,
+    door_pos: torch.Tensor,
+    door_open: torch.Tensor,
+    progress_max_y: torch.Tensor,
+    held_cube: torch.Tensor,
+    steps_left: torch.Tensor,
+    env_ids: torch.Tensor,
+    partner_ids: torch.Tensor,
+    agent_ids: torch.Tensor,
+    lidar_beam: torch.Tensor,
+) -> torch.Tensor:
+    """Pure observation math, kept side-effect free so it can be compiled."""
+    num_envs = agent_pos.shape[0]
+    room_idx = torch.clamp((agent_pos[..., 1] / ROOM_LENGTH).long(), 0, NUM_ROOMS - 1)
+    env_idx = env_ids[:, None]
+    current_entities = entity_pos[env_idx, room_idx]
+    current_types = entity_type[env_idx, room_idx]
+    current_active = entity_active[env_idx, room_idx]
+    current_doors = door_pos[env_idx, room_idx]
+    current_open = door_open[env_idx, room_idx]
+
+    self_obs = torch.stack(
+        (
+            agent_pos[..., 0] / (WORLD_WIDTH * 0.5),
+            (agent_pos[..., 1] % ROOM_LENGTH) / ROOM_LENGTH,
+            agent_pos[..., 0] / (WORLD_WIDTH * 0.5),
+            agent_pos[..., 1] / WORLD_LENGTH,
+            agent_pos[..., 2],
+            progress_max_y / WORLD_LENGTH,
+            yaw / math.pi,
+            (held_cube >= 0).float(),
+        ),
+        dim=-1,
+    )
+    partner_rel = agent_pos[:, partner_ids, :2] - agent_pos[..., :2]
+    partner_obs = torch.stack(
+        (
+            torch.linalg.vector_norm(partner_rel, dim=-1) / WORLD_LENGTH,
+            (torch.atan2(partner_rel[..., 1], partner_rel[..., 0]) - yaw) / math.pi,
+            (held_cube[:, partner_ids] >= 0).float(),
+        ),
+        dim=-1,
+    )
+    rel = current_entities[..., :2] - agent_pos[..., None, :2]
+    room_obs = torch.stack(
+        (
+            torch.linalg.vector_norm(rel, dim=-1) / WORLD_LENGTH,
+            (torch.atan2(rel[..., 1], rel[..., 0]) - yaw[..., None]) / math.pi,
+            current_types.float() / float(EntityType.NUM_TYPES),
+        ),
+        dim=-1,
+    )
+    room_obs = torch.where(
+        current_active[..., None], room_obs, torch.zeros_like(room_obs)
+    ).flatten(2)
+    door_rel = current_doors[..., :2] - agent_pos[..., :2]
+    door_obs = torch.stack(
+        (
+            torch.linalg.vector_norm(door_rel, dim=-1) / WORLD_LENGTH,
+            (torch.atan2(door_rel[..., 1], door_rel[..., 0]) - yaw) / math.pi,
+            current_open.float(),
+        ),
+        dim=-1,
+    )
+    lidar = _lidar_impl(agent_pos[..., :2], yaw, lidar_beam)
+    steps = steps_left.view(num_envs, 1, 1).expand(-1, NUM_AGENTS, -1) / EPISODE_LEN
+    ident = agent_ids.expand(num_envs, -1, -1)
+    return torch.cat(
+        (self_obs, partner_obs, room_obs, door_obs, lidar, steps, ident), dim=-1
+    ).flatten(1)
+
+
 @dataclass(kw_only=True)
 class EscapeRoomActionCfg(ActionTermCfg):
     """Configuration for the combined two-agent game action term."""
 
     max_speed: float = 8.0
     max_yaw_rate: float = 4.0
+    compile_game: bool = False
+    """Compile the observation math with ``torch.compile`` (static shapes)."""
 
     def build(self, env):
         return EscapeRoomAction(self, env)
@@ -116,11 +221,88 @@ class EscapeRoomAction(ActionTerm):
         self._grab_was_down = torch.zeros(
             self.num_envs, NUM_AGENTS, dtype=torch.bool, device=self.device
         )
+        self._env_ids = torch.arange(self.num_envs, device=self.device)
+        self._cube_ids = torch.arange(len(self._cubes), device=self.device)
+        self._partner_ids = torch.arange(NUM_AGENTS - 1, -1, -1, device=self.device)
+        self._agent_ids = torch.arange(
+            NUM_AGENTS, dtype=torch.float32, device=self.device
+        ).view(1, NUM_AGENTS, 1)
+        self._lidar_beam = torch.linspace(
+            -math.pi, math.pi, NUM_LIDAR_SAMPLES + 1, device=self.device
+        )[:-1].view(1, 1, NUM_LIDAR_SAMPLES)
         self.progress_max_y = torch.zeros(
             self.num_envs, NUM_AGENTS, device=self.device
         )
         self.progress_delta = torch.zeros_like(self.progress_max_y)
+        self._mean_progress_delta = torch.zeros(self.num_envs, device=self.device)
+        self._slack = torch.ones(self.num_envs, device=self.device)
+        self._pose_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._cube_pos_cache: torch.Tensor | None = None
+        self._cube_slots_synced = False
+        self._build_index_tables()
         self._build_level_pool()
+        self._observation_fn = _observation_impl
+        if cfg.compile_game:
+            self._observation_fn = torch.compile(_observation_impl, dynamic=False)
+
+    def _build_index_tables(self) -> None:
+        """Cache flat indices so every body is read/written in one batched op.
+
+        mjlab entities are thin views over the shared MuJoCo-Warp state, so a
+        per-entity loop costs one kernel launch per agent/cube/door. Gathering
+        the addresses once collapses those loops into a handful of launches.
+        """
+        self._sim_data = self._agents[0].data.data
+        self._num_cubes = len(self._cubes)
+
+        def free_joint_adr(entities, attr: str) -> torch.Tensor:
+            return torch.stack(
+                [getattr(e.data.indexing, attr) for e in entities]
+            ).to(device=self.device, dtype=torch.long)
+
+        def body_ids(entities) -> torch.Tensor:
+            return torch.tensor(
+                [e.data.indexing.root_body_id for e in entities],
+                device=self.device,
+                dtype=torch.long,
+            )
+
+        def mocap_ids(entities) -> torch.Tensor:
+            return torch.tensor(
+                [e.data.indexing.mocap_id for e in entities],
+                device=self.device,
+                dtype=torch.long,
+            )
+
+        agent_q = free_joint_adr(self._agents, "free_joint_q_adr")
+        self._agent_q_flat = agent_q.reshape(-1)
+        self._agent_quat_flat = agent_q[:, 3:7].reshape(-1)
+        self._agent_v_flat = free_joint_adr(
+            self._agents, "free_joint_v_adr"
+        ).reshape(-1)
+        self._agent_body_ids = body_ids(self._agents)
+
+        self._cube_q_flat = free_joint_adr(
+            self._cubes, "free_joint_q_adr"
+        ).reshape(-1)
+        self._cube_v_flat = free_joint_adr(
+            self._cubes, "free_joint_v_adr"
+        ).reshape(-1)
+        self._cube_body_ids = body_ids(self._cubes)
+
+        self._door_mocap_ids = mocap_ids(self._doors)
+        self._button_mocap_ids = mocap_ids(self._buttons)
+        self._door_z_offset = torch.tensor(
+            [0.0, 0.0, 0.875], device=self.device
+        ).view(1, 1, 3)
+        self._identity_quat = torch.tensor(
+            [1.0, 0.0, 0.0, 0.0], device=self.device
+        )
+
+    def _invalidate_cache(self) -> None:
+        self._pose_cache = None
+        self._cube_pos_cache = None
+        self._cube_slots_synced = False
 
     @property
     def action_dim(self) -> int:
@@ -166,20 +348,35 @@ class EscapeRoomAction(ActionTerm):
 
     def _ids(self, env_ids) -> torch.Tensor:
         if env_ids is None or isinstance(env_ids, slice):
-            return torch.arange(self.num_envs, device=self.device)
+            return self._env_ids
         return env_ids.to(device=self.device, dtype=torch.long)
 
-    def _write_pose(self, entity, env_ids: torch.Tensor, pos: torch.Tensor) -> None:
-        pose = torch.zeros((env_ids.numel(), 7), device=self.device)
-        pose[:, :3] = pos
-        pose[:, 3] = 1.0
-        if entity.data.is_fixed_base:
-            entity.data.write_mocap_pose(pose, env_ids)
-        else:
-            entity.data.write_root_pose(pose, env_ids)
-            entity.data.write_root_velocity(
-                torch.zeros((env_ids.numel(), 6), device=self.device), env_ids
-            )
+    def _write_free_bodies(
+        self,
+        q_flat: torch.Tensor,
+        v_flat: torch.Tensor,
+        env_ids: torch.Tensor,
+        pos: torch.Tensor,
+    ) -> None:
+        """Write identity-oriented poses and zero velocities for free bodies."""
+        count = pos.shape[1]
+        pose = torch.zeros((pos.shape[0], count, 7), device=self.device)
+        pose[..., :3] = pos
+        pose[..., 3] = 1.0
+        rows = env_ids[:, None]
+        self._sim_data.qpos[rows, q_flat] = pose.reshape(pos.shape[0], -1)
+        self._sim_data.qvel[rows, v_flat] = torch.zeros(
+            (pos.shape[0], v_flat.numel()), device=self.device
+        )
+
+    def _write_mocap_bodies(
+        self, mocap_ids: torch.Tensor, env_ids: torch.Tensor, pos: torch.Tensor
+    ) -> None:
+        rows = env_ids[:, None]
+        self._sim_data.mocap_pos[rows, mocap_ids] = pos
+        self._sim_data.mocap_quat[rows, mocap_ids] = self._identity_quat.expand(
+            pos.shape[0], pos.shape[1], 4
+        )
 
     def reset(self, env_ids=None):
         ids = self._ids(env_ids)
@@ -198,70 +395,83 @@ class EscapeRoomAction(ActionTerm):
         self._grab_was_down[ids] = False
         self.progress_delta[ids] = 0.0
 
+        count = ids.numel()
         spawn_x = (
-            2.0 * torch.rand(ids.numel(), NUM_AGENTS, device=self.device) - 1.0
+            2.0 * torch.rand(count, NUM_AGENTS, device=self.device) - 1.0
         ) * AGENT_SPAWN_X_SPREAD
         spawn_y = (
-            torch.rand(ids.numel(), NUM_AGENTS, device=self.device)
+            torch.rand(count, NUM_AGENTS, device=self.device)
             * (AGENT_SPAWN_Y_MAX - AGENT_SPAWN_Y_MIN)
             + AGENT_SPAWN_Y_MIN
         )
         self.progress_max_y[ids] = spawn_y
-        for agent_idx, agent in enumerate(self._agents):
-            pos = torch.stack(
-                (spawn_x[:, agent_idx], spawn_y[:, agent_idx], torch.full_like(spawn_y[:, agent_idx], 0.5)),
-                dim=-1,
-            )
-            self._write_pose(agent, ids, pos)
+        agent_pos = torch.stack(
+            (spawn_x, spawn_y, torch.full_like(spawn_y, 0.5)), dim=-1
+        )
+        self._write_free_bodies(
+            self._agent_q_flat, self._agent_v_flat, ids, agent_pos
+        )
 
-        for room_idx, door in enumerate(self._doors):
-            pos = self.door_pos[ids, room_idx].clone()
-            pos[:, 2] += 0.875
-            self._write_pose(door, ids, pos)
+        self._write_mocap_bodies(
+            self._door_mocap_ids, ids, self.door_pos[ids] + self._door_z_offset
+        )
 
-        for room_idx in range(NUM_ROOMS):
-            for slot_idx in range(2):
-                entity_idx = room_idx * 2 + slot_idx
-                pos = self.entity_pos[ids, room_idx, slot_idx].clone()
-                enabled = self.entity_active[ids, room_idx, slot_idx]
-                pos[:, 2] = torch.where(enabled, torch.full_like(pos[:, 2], 0.10), -10.0)
-                self._write_pose(self._buttons[entity_idx], ids, pos)
-            for slot_idx in range(2, 6):
-                entity_idx = room_idx * 4 + slot_idx - 2
-                pos = self.entity_pos[ids, room_idx, slot_idx].clone()
-                enabled = self.entity_active[ids, room_idx, slot_idx]
-                pos[:, 2] = torch.where(enabled, torch.full_like(pos[:, 2], 0.80), -10.0)
-                self._write_pose(self._cubes[entity_idx], ids, pos)
+        slots = self.entity_pos[ids]
+        active = self.entity_active[ids]
+        button_pos = slots[:, :, 0:2].reshape(count, -1, 3).clone()
+        button_pos[..., 2] = torch.where(
+            active[:, :, 0:2].reshape(count, -1), 0.10, -10.0
+        )
+        self._write_mocap_bodies(self._button_mocap_ids, ids, button_pos)
+
+        cube_pos = slots[:, :, 2:6].reshape(count, -1, 3).clone()
+        cube_pos[..., 2] = torch.where(
+            active[:, :, 2:6].reshape(count, -1), 0.80, -10.0
+        )
+        self._write_free_bodies(
+            self._cube_q_flat, self._cube_v_flat, ids, cube_pos
+        )
+        self._invalidate_cache()
 
     def _agent_pose(self) -> tuple[torch.Tensor, torch.Tensor]:
-        pose = torch.stack([agent.data.root_link_pose_w for agent in self._agents], dim=1)
-        return pose[..., :3], _yaw_from_quat(pose[..., 3:7])
+        if self._pose_cache is None:
+            data = self._sim_data
+            pos = data.xpos[:, self._agent_body_ids]
+            yaw = _yaw_from_quat(data.xquat[:, self._agent_body_ids])
+            self._pose_cache = (pos, yaw)
+        return self._pose_cache
 
     def _cube_positions(self) -> torch.Tensor:
-        return torch.stack([cube.data.root_link_pos_w for cube in self._cubes], dim=1)
+        if self._cube_pos_cache is None:
+            self._cube_pos_cache = self._sim_data.xpos[:, self._cube_body_ids]
+        return self._cube_pos_cache
 
     def _sync_cube_slots(self) -> torch.Tensor:
         cube_pos = self._cube_positions()
-        for room_idx in range(NUM_ROOMS):
-            self.entity_pos[:, room_idx, 2:6] = cube_pos[:, room_idx * 4 : (room_idx + 1) * 4]
+        if not self._cube_slots_synced:
+            self.entity_pos[:, :, 2:6] = cube_pos.view(
+                self.num_envs, NUM_ROOMS, -1, 3
+            )
+            self._cube_slots_synced = True
         return cube_pos
 
     def _update_buttons_and_doors(self) -> None:
         agent_pos, _ = self._agent_pose()
         cube_pos = self._sync_cube_slots()
-        cube_active = self.entity_active[:, :, 2:6].reshape(self.num_envs, -1)
-        self.button_pressed.zero_()
         radius_sq = (BUTTON_WIDTH * 0.5 + AGENT_RADIUS * 0.5) ** 2
-        for room_idx in range(NUM_ROOMS):
-            for slot_idx in range(2):
-                active = self.entity_active[:, room_idx, slot_idx]
-                button = self.entity_pos[:, room_idx, slot_idx, :2]
-                agent_dist_sq = ((agent_pos[..., :2] - button[:, None]) ** 2).sum(-1)
-                cube_dist_sq = ((cube_pos[..., :2] - button[:, None]) ** 2).sum(-1)
-                pressed = (agent_dist_sq <= radius_sq).any(-1) | (
-                    (cube_dist_sq <= radius_sq) & cube_active
-                ).any(-1)
-                self.button_pressed[:, room_idx, slot_idx] = active & pressed
+        button_xy = self.entity_pos[:, :, 0:2, :2].unsqueeze(-2)
+        agent_xy = agent_pos[..., :2].view(self.num_envs, 1, 1, NUM_AGENTS, 2)
+        cube_xy = cube_pos[..., :2].view(self.num_envs, 1, 1, self._num_cubes, 2)
+        cube_active = self.entity_active[:, :, 2:6].reshape(
+            self.num_envs, 1, 1, -1
+        )
+        agent_hit = ((agent_xy - button_xy).square().sum(-1) <= radius_sq).any(-1)
+        cube_hit = (
+            ((cube_xy - button_xy).square().sum(-1) <= radius_sq) & cube_active
+        ).any(-1)
+        self.button_pressed[:, :, 0:2] = self.entity_active[:, :, 0:2] & (
+            agent_hit | cube_hit
+        )
 
         required = self.door_button_mask
         satisfied = (~required) | self.button_pressed
@@ -278,43 +488,43 @@ class EscapeRoomAction(ActionTerm):
     def _update_grab(self, grab_down: torch.Tensor) -> None:
         rising = grab_down & ~self._grab_was_down
         self._grab_was_down.copy_(grab_down)
-        if not rising.any():
-            return
         agent_pos, yaw = self._agent_pose()
         cube_pos = self._cube_positions()
-        cube_active = self.entity_active[:, :, 2:6].reshape(self.num_envs, -1)
-        for agent_idx in range(NUM_AGENTS):
-            pressed_ids = rising[:, agent_idx].nonzero(as_tuple=False).squeeze(-1)
-            if pressed_ids.numel() == 0:
-                continue
-            holding = self.held_cube[pressed_ids, agent_idx] >= 0
-            release_ids = pressed_ids[holding]
-            self.held_cube[release_ids, agent_idx] = -1
-            acquire_ids = pressed_ids[~holding]
-            if acquire_ids.numel() == 0:
-                continue
-            forward = torch.stack((-torch.sin(yaw[acquire_ids, agent_idx]), torch.cos(yaw[acquire_ids, agent_idx])), dim=-1)
-            origin = agent_pos[acquire_ids, agent_idx, :2] + forward * AGENT_RADIUS
-            rel = cube_pos[acquire_ids, :, :2] - origin[:, None]
-            along = (rel * forward[:, None]).sum(-1)
-            perp_sq = (rel.square().sum(-1) - along.square()).clamp_min(0.0)
-            already_held = (
-                torch.arange(len(self._cubes), device=self.device)[None, :, None]
-                == self.held_cube[:, None, :]
-            ).any(-1)
-            valid = (
-                (along >= 0.0)
-                & (along <= GRAB_RAY_LENGTH)
-                & (perp_sq <= 0.9**2)
-                & cube_active[acquire_ids]
-                & ~already_held[acquire_ids]
-            )
-            distance = torch.where(valid, along, torch.full_like(along, float("inf")))
-            nearest_distance, nearest = distance.min(-1)
-            hit = torch.isfinite(nearest_distance)
-            self.held_cube[acquire_ids[hit], agent_idx] = nearest[hit]
+        cube_active = self.entity_active[:, :, 2:6].reshape(self.num_envs, 1, -1)
+        held = self.held_cube
+        was_holding = held >= 0
+        current = torch.where(
+            rising & was_holding, torch.full_like(held, -1), held
+        )
+        acquire = rising & ~was_holding
+        forward = torch.stack((-torch.sin(yaw), torch.cos(yaw)), dim=-1)
+        origin = agent_pos[..., :2] + forward * AGENT_RADIUS
+        rel = cube_pos[:, None, :, :2] - origin[:, :, None, :]
+        along = (rel * forward[:, :, None, :]).sum(-1)
+        perp_sq = (rel.square().sum(-1) - along.square()).clamp_min(0.0)
+        already_held = (
+            self._cube_ids.view(1, -1, 1) == held[:, None, :]
+        ).any(-1).unsqueeze(1)
+        valid = (
+            acquire[..., None]
+            & (along >= 0.0)
+            & (along <= GRAB_RAY_LENGTH)
+            & (perp_sq <= 0.9**2)
+            & cube_active
+            & ~already_held
+        )
+        distance = torch.where(valid, along, torch.full_like(along, float("inf")))
+        nearest_distance, nearest = distance.min(-1)
+        hit = torch.isfinite(nearest_distance)
+        acquired = torch.where(hit, nearest, current)
+        # Preserve the sequential semantics of the original per-agent loop: if
+        # both agents target the same cube on the same step, agent 0 wins.
+        conflict = hit[:, 0] & hit[:, 1] & (acquired[:, 0] == acquired[:, 1])
+        acquired[:, 1] = torch.where(conflict, current[:, 1], acquired[:, 1])
+        self.held_cube.copy_(acquired)
 
     def process_actions(self, actions: torch.Tensor) -> None:
+        self._invalidate_cache()
         self._raw_actions.copy_(actions)
         self._processed_actions.copy_(actions.clamp(-1.0, 1.0))
         shaped = self._processed_actions.view(self.num_envs, NUM_AGENTS, ACTION_DIM_PER_AGENT)
@@ -330,129 +540,91 @@ class EscapeRoomAction(ActionTerm):
         vx = self.cfg.max_speed * (move[..., 0] * cos_yaw - move[..., 1] * sin_yaw)
         vy = self.cfg.max_speed * (move[..., 0] * sin_yaw + move[..., 1] * cos_yaw)
         yaw_rate = shaped[..., 2] * self.cfg.max_yaw_rate
-        for agent_idx, agent in enumerate(self._agents):
-            velocity = torch.zeros((self.num_envs, 6), device=self.device)
-            velocity[:, 0] = vx[:, agent_idx]
-            velocity[:, 1] = vy[:, agent_idx]
-            velocity[:, 5] = yaw_rate[:, agent_idx]
-            agent.data.write_root_velocity(velocity)
+        zeros = torch.zeros_like(vx)
+        lin_vel = torch.stack((vx, vy, zeros), dim=-1)
+        ang_vel_w = torch.stack((zeros, zeros, yaw_rate), dim=-1)
+        quat_w = self._sim_data.qpos[:, self._agent_quat_flat].view(
+            self.num_envs, NUM_AGENTS, 4
+        )
+        ang_vel_b = quat_apply_inverse(quat_w, ang_vel_w)
+        self._sim_data.qvel[:, self._agent_v_flat] = torch.cat(
+            (lin_vel, ang_vel_b), dim=-1
+        ).view(self.num_envs, -1)
 
     def _apply_attachments(self) -> None:
         agent_pos, yaw = self._agent_pose()
-        for agent_idx in range(NUM_AGENTS):
-            ids = (self.held_cube[:, agent_idx] >= 0).nonzero(as_tuple=False).squeeze(-1)
-            if ids.numel() == 0:
-                continue
-            cube_ids = self.held_cube[ids, agent_idx]
-            forward = torch.stack((-torch.sin(yaw[ids, agent_idx]), torch.cos(yaw[ids, agent_idx])), dim=-1)
-            pos = agent_pos[ids, agent_idx].clone()
-            pos[:, :2] += forward * GRAB_OFFSET_FWD
-            pos[:, 2] = 0.85
-            quat = _quat_from_yaw(yaw[ids, agent_idx])
-            pose = torch.cat((pos, quat), dim=-1)
-            velocity = torch.zeros((ids.numel(), 6), device=self.device)
-            shaped = self._processed_actions.view(self.num_envs, NUM_AGENTS, ACTION_DIM_PER_AGENT)
-            velocity[:, :2] = shaped[ids, agent_idx, :2] * self.cfg.max_speed
-            for cube_idx, cube in enumerate(self._cubes):
-                selected = cube_ids == cube_idx
-                if selected.any():
-                    selected_ids = ids[selected]
-                    cube.data.write_root_pose(pose[selected], selected_ids)
-                    cube.data.write_root_velocity(velocity[selected], selected_ids)
+        forward = torch.stack((-torch.sin(yaw), torch.cos(yaw)), dim=-1)
+        pos = agent_pos.clone()
+        pos[..., :2] += forward * GRAB_OFFSET_FWD
+        pos[..., 2] = 0.85
+        pose = torch.cat((pos, _quat_from_yaw(yaw)), dim=-1)
+        shaped = self._processed_actions.view(
+            self.num_envs, NUM_AGENTS, ACTION_DIM_PER_AGENT
+        )
+        velocity = torch.zeros((self.num_envs, NUM_AGENTS, 6), device=self.device)
+        velocity[..., :2] = shaped[..., :2] * self.cfg.max_speed
+
+        held_by = self.held_cube[:, :, None] == self._cube_ids.view(1, 1, -1)
+        held_any = held_by.any(1, keepdim=True).transpose(1, 2)
+        by_agent_0 = held_by[:, 0].unsqueeze(-1)
+        selected_pose = torch.where(by_agent_0, pose[:, 0:1], pose[:, 1:2])
+        selected_velocity = torch.where(by_agent_0, velocity[:, 0:1], velocity[:, 1:2])
+
+        data = self._sim_data
+        current_pose = data.qpos[:, self._cube_q_flat].view(
+            self.num_envs, self._num_cubes, 7
+        )
+        data.qpos[:, self._cube_q_flat] = torch.where(
+            held_any, selected_pose, current_pose
+        ).view(self.num_envs, -1)
+        current_velocity = data.qvel[:, self._cube_v_flat].view(
+            self.num_envs, self._num_cubes, 6
+        )
+        data.qvel[:, self._cube_v_flat] = torch.where(
+            held_any, selected_velocity, current_velocity
+        ).view(self.num_envs, -1)
 
     def _apply_doors(self) -> None:
-        ids = self._ids(None)
-        for room_idx, door in enumerate(self._doors):
-            pose = torch.zeros((self.num_envs, 7), device=self.device)
-            pose[:, :3] = self.door_pos[:, room_idx]
-            pose[:, 2] += 0.875
-            pose[:, 3] = 1.0
-            door.data.write_mocap_pose(pose, ids)
+        self._sim_data.mocap_pos[:, self._door_mocap_ids] = (
+            self.door_pos + self._door_z_offset
+        )
 
     def apply_actions(self) -> None:
+        self._invalidate_cache()
         self._apply_agent_controls()
         self._apply_attachments()
         self._apply_doors()
+        self._invalidate_cache()
 
     def observation(self) -> torch.Tensor:
+        self._invalidate_cache()
         agent_pos, yaw = self._agent_pose()
         self._sync_cube_slots()
-        room_idx = torch.clamp((agent_pos[..., 1] / ROOM_LENGTH).long(), 0, NUM_ROOMS - 1)
-        env_idx = torch.arange(self.num_envs, device=self.device)[:, None]
-        current_entities = self.entity_pos[env_idx, room_idx]
-        current_types = self.entity_type[env_idx, room_idx]
-        current_active = self.entity_active[env_idx, room_idx]
-        current_doors = self.door_pos[env_idx, room_idx]
-        current_open = self.door_open[env_idx, room_idx]
-
-        per_agent = []
-        for agent_idx in range(NUM_AGENTS):
-            pos = agent_pos[:, agent_idx]
-            self_obs = torch.stack(
-                (
-                    pos[:, 0] / (WORLD_WIDTH * 0.5),
-                    (pos[:, 1] % ROOM_LENGTH) / ROOM_LENGTH,
-                    pos[:, 0] / (WORLD_WIDTH * 0.5),
-                    pos[:, 1] / WORLD_LENGTH,
-                    pos[:, 2],
-                    self.progress_max_y[:, agent_idx] / WORLD_LENGTH,
-                    yaw[:, agent_idx] / math.pi,
-                    (self.held_cube[:, agent_idx] >= 0).float(),
-                ),
-                dim=-1,
-            )
-            partner_idx = 1 - agent_idx
-            partner_rel = agent_pos[:, partner_idx, :2] - pos[:, :2]
-            partner_obs = torch.stack(
-                (
-                    torch.linalg.vector_norm(partner_rel, dim=-1) / WORLD_LENGTH,
-                    (torch.atan2(partner_rel[:, 1], partner_rel[:, 0]) - yaw[:, agent_idx]) / math.pi,
-                    (self.held_cube[:, partner_idx] >= 0).float(),
-                ),
-                dim=-1,
-            )
-            rel = current_entities[:, agent_idx, :, :2] - pos[:, None, :2]
-            distances = torch.linalg.vector_norm(rel, dim=-1) / WORLD_LENGTH
-            angles = (torch.atan2(rel[..., 1], rel[..., 0]) - yaw[:, agent_idx, None]) / math.pi
-            types = current_types[:, agent_idx].float() / float(EntityType.NUM_TYPES)
-            room_obs = torch.stack((distances, angles, types), dim=-1)
-            room_obs = torch.where(current_active[:, agent_idx, :, None], room_obs, torch.zeros_like(room_obs)).flatten(1)
-            door_rel = current_doors[:, agent_idx, :2] - pos[:, :2]
-            door_obs = torch.stack(
-                (
-                    torch.linalg.vector_norm(door_rel, dim=-1) / WORLD_LENGTH,
-                    (torch.atan2(door_rel[:, 1], door_rel[:, 0]) - yaw[:, agent_idx]) / math.pi,
-                    current_open[:, agent_idx].float(),
-                ),
-                dim=-1,
-            )
-            lidar = self._lidar(pos[:, :2], yaw[:, agent_idx])
-            steps = (EPISODE_LEN - self._env.episode_length_buf).float().unsqueeze(-1) / EPISODE_LEN
-            ident = torch.full_like(steps, float(agent_idx))
-            per_agent.append(torch.cat((self_obs, partner_obs, room_obs, door_obs, lidar, steps, ident), dim=-1))
-        return torch.cat(per_agent, dim=-1)
-
-    def _lidar(self, origin: torch.Tensor, yaw: torch.Tensor) -> torch.Tensor:
-        beam = torch.linspace(-math.pi, math.pi, NUM_LIDAR_SAMPLES + 1, device=self.device)[:-1]
-        angle = yaw[:, None] + beam[None]
-        direction = torch.stack((torch.cos(angle), torch.sin(angle)), dim=-1)
-        eps = 1.0e-6
-        tx_pos = ((WORLD_WIDTH * 0.5) - origin[:, 0, None]) / direction[..., 0].clamp_min(eps)
-        tx_neg = ((-WORLD_WIDTH * 0.5) - origin[:, 0, None]) / direction[..., 0].clamp_max(-eps)
-        ty_pos = (WORLD_LENGTH - origin[:, 1, None]) / direction[..., 1].clamp_min(eps)
-        ty_neg = (0.0 - origin[:, 1, None]) / direction[..., 1].clamp_max(-eps)
-        candidates = torch.stack((tx_pos, tx_neg, ty_pos, ty_neg), dim=-1)
-        candidates = torch.where(candidates > 0.0, candidates, torch.full_like(candidates, float("inf")))
-        depth = candidates.min(-1).values.clamp(max=LIDAR_MAX_RANGE) / LIDAR_MAX_RANGE
-        hit_type = torch.full_like(depth, float(EntityType.WALL) / float(EntityType.NUM_TYPES))
-        return torch.stack((depth, hit_type), dim=-1).flatten(1)
+        steps_left = (EPISODE_LEN - self._env.episode_length_buf).float()
+        return self._observation_fn(
+            agent_pos,
+            yaw,
+            self.entity_pos,
+            self.entity_type,
+            self.entity_active,
+            self.door_pos,
+            self.door_open,
+            self.progress_max_y,
+            self.held_cube,
+            steps_left,
+            self._env_ids,
+            self._partner_ids,
+            self._agent_ids,
+            self._lidar_beam,
+        )
 
     def consume_progress_reward(self) -> torch.Tensor:
         agent_pos, _ = self._agent_pose()
         y = agent_pos[..., 1]
         self.progress_delta = (y - self.progress_max_y).clamp_min(0.0)
         self.progress_max_y = torch.maximum(self.progress_max_y, y)
-        return self.progress_delta.mean(-1)
+        self._mean_progress_delta = self.progress_delta.mean(-1)
+        return self._mean_progress_delta
 
 
 def game_term(env) -> EscapeRoomAction:
@@ -468,14 +640,14 @@ def progress_reward(env) -> torch.Tensor:
 
 
 def slack_reward(env) -> torch.Tensor:
-    return torch.ones(env.num_envs, device=env.device)
+    return game_term(env)._slack
 
 
 def partner_bonus(env) -> torch.Tensor:
     game = game_term(env)
     pos, _ = game._agent_pose()
     close = torch.linalg.vector_norm(pos[:, 0, :2] - pos[:, 1, :2], dim=-1) < PARTNER_CLOSE_THRESHOLD
-    return close.float() * game.progress_delta.mean(-1)
+    return close.float() * game._mean_progress_delta
 
 
 PROGRESS_REWARD_WEIGHT = REWARD_PER_DIST

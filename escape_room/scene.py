@@ -125,7 +125,7 @@ def _arena_spec():
     half_wall = WALL_WIDTH * 0.5
     wall_height = 1.75
     geoms = [
-        f'<geom name="floor" type="plane" pos="0 {WORLD_LENGTH * 0.5} 0" '
+        f'<geom name="floor" type="box" pos="0 {WORLD_LENGTH * 0.5} -0.1" '
         f'size="{half_width} {WORLD_LENGTH * 0.5} 0.1" '
         'rgba="0.42 0.44 0.48 1" friction="1 0.01 0.001"/>',
         f'<geom name="border_left" type="box" pos="{-half_width - half_wall} '
@@ -196,10 +196,12 @@ def _button_spec():
     )
 
 
-def _cube_spec():
+def _cube_spec(cube_idx: int):
+    parking_x = -30.0 - 2.0 * cube_idx
     return _spec_from_xml(
         '<mujoco model="cube"><compiler autolimits="true"/>'
-        '<worldbody><body name="body"><freejoint name="root"/>'
+        f'<worldbody><body name="body" pos="{parking_x} 0 -10">'
+        '<freejoint name="root"/>'
         '<geom name="geom" type="box" size="0.75 0.75 0.75" mass="2" '
         'rgba="0.12 0.28 0.85 1" friction="1.2 0.02 0.002"/>'
         '</body></worldbody></mujoco>'
@@ -221,6 +223,8 @@ def make_scene_entities() -> dict[str, "EntityCfg"]:
         entities[name] = EntityCfg(spec_fn=_door_spec)
     for name in BUTTON_ENTITY_NAMES:
         entities[name] = EntityCfg(spec_fn=_button_spec)
-    for name in CUBE_ENTITY_NAMES:
-        entities[name] = EntityCfg(spec_fn=_cube_spec)
+    for cube_idx, name in enumerate(CUBE_ENTITY_NAMES):
+        entities[name] = EntityCfg(
+            spec_fn=lambda idx=cube_idx: _cube_spec(idx)
+        )
     return entities

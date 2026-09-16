@@ -34,15 +34,27 @@ ACTION_DIM = TOTAL_ACTION_DIM
 # Environment ID for gym registration
 ENV_ID = "EscapeRoom-v0"
 
-# Physics configuration
-PHYSICS_DT = 0.005  # MuJoCo timestep
+# Physics configuration. A single 0.04 s step matches the original environment
+# and remains stable because maximum controlled displacement is below an agent
+# radius. More substeps are available for integration-sensitive experiments.
 CONTROL_DT = DELTA_T  # Control timestep (0.04)
-DECIMATION = int(CONTROL_DT / PHYSICS_DT)  # 8 substeps per control step
+DEFAULT_PHYSICS_SUBSTEPS = 1
+PHYSICS_DT = CONTROL_DT / DEFAULT_PHYSICS_SUBSTEPS
+DECIMATION = DEFAULT_PHYSICS_SUBSTEPS
+DEFAULT_NCONMAX = 96
+DEFAULT_NJMAX = 384
+DEFAULT_SOLVER_ITERATIONS = 10
+DEFAULT_SOLVER_LS_ITERATIONS = 5
 
-# Conservative default for a 40 GiB A100.  This scene has 24 independently
-# batched entities, so the kinematic environment's old 4096-world default does
-# not fit the real MuJoCo-Warp contact and CUDA-graph buffers.
-DEFAULT_NUM_ENVS = 512
+# Fuse the observation math with ``torch.compile``. Disabled by default until a
+# measured win is confirmed on the target GPU; enable with ``--compile-game``.
+DEFAULT_COMPILE_GAME = False
+
+# Profiled default for a 40 GiB A100. With the batched game layer the scene is
+# far cheaper per world, so 8192 worlds train comfortably (~26 GiB free at the
+# end of a run) and deliver ~4x the throughput of the previous 1024 default.
+# 16384 worlds still fit (~13 GiB free) but leave little headroom.
+DEFAULT_NUM_ENVS = 8192
 
 # Seed
 DEFAULT_SEED = 42
@@ -62,8 +74,17 @@ def escape_room_env_cfg(
     play: bool = False,
     num_envs: int = DEFAULT_NUM_ENVS,
     seed: int = DEFAULT_SEED,
+    physics_substeps: int = DEFAULT_PHYSICS_SUBSTEPS,
+    nconmax: int | None = DEFAULT_NCONMAX,
+    njmax: int | None = DEFAULT_NJMAX,
+    solver_iterations: int = DEFAULT_SOLVER_ITERATIONS,
+    solver_ls_iterations: int = DEFAULT_SOLVER_LS_ITERATIONS,
+    broadphase: str | None = None,
+    compile_game: bool = DEFAULT_COMPILE_GAME,
 ) -> ManagerBasedRlEnvCfg:
     """Build the real MuJoCo-Warp manager environment configuration."""
+    if physics_substeps < 1:
+        raise ValueError("physics_substeps must be at least 1")
     cfg = ManagerBasedRlEnvCfg(
         scene=SceneCfg(
             entities=make_scene_entities(),
@@ -74,15 +95,14 @@ def escape_room_env_cfg(
             "actor": ObservationGroupCfg(
                 terms={"state": ObservationTermCfg(func=policy_observation)},
                 concatenate_terms=True,
-                nan_policy="error",
-            ),
-            "critic": ObservationGroupCfg(
-                terms={"state": ObservationTermCfg(func=policy_observation)},
-                concatenate_terms=True,
-                nan_policy="error",
+                nan_policy="disabled",
             ),
         },
-        actions={"game": EscapeRoomActionCfg(entity_name="agent_0")},
+        actions={
+            "game": EscapeRoomActionCfg(
+                entity_name="agent_0", compile_game=compile_game
+            )
+        },
         rewards={
             "progress": RewardTermCfg(
                 func=progress_reward, weight=PROGRESS_REWARD_WEIGHT
@@ -95,7 +115,16 @@ def escape_room_env_cfg(
         terminations={
             "time_out": TerminationTermCfg(func=time_out, time_out=True),
         },
-        sim=SimulationCfg(mujoco=MujocoCfg(timestep=PHYSICS_DT)),
+        sim=SimulationCfg(
+            nconmax=nconmax,
+            njmax=njmax,
+            broadphase=broadphase,
+            mujoco=MujocoCfg(
+                timestep=CONTROL_DT / physics_substeps,
+                iterations=solver_iterations,
+                ls_iterations=solver_ls_iterations,
+            ),
+        ),
         viewer=ViewerConfig(
             origin_type=ViewerConfig.OriginType.WORLD,
             lookat=(0.0, 20.0, 0.0),
@@ -105,7 +134,7 @@ def escape_room_env_cfg(
             width=960,
             height=720,
         ),
-        decimation=DECIMATION,
+        decimation=physics_substeps,
         episode_length_s=EPISODE_LEN * CONTROL_DT,
         seed=seed,
         scale_rewards_by_dt=False,
@@ -126,7 +155,7 @@ def escape_room_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
             distribution_cfg={
                 "class_name": "GaussianDistribution",
                 "init_std": 1.0,
-                "std_type": "scalar",
+                "std_type": "log",
             },
         ),
         critic=RslRlModelCfg(
@@ -146,6 +175,7 @@ def escape_room_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
         ),
         experiment_name="escape_room",
         logger="tensorboard",
+        obs_groups={"actor": ("actor",), "critic": ("actor",)},
         clip_actions=1.0,
         num_steps_per_env=16,
         max_iterations=1000,

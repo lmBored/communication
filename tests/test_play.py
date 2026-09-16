@@ -2,7 +2,14 @@ import os
 import sys
 from argparse import Namespace
 
-from escape_room.play import _needs_mjpython, _relaunch_with_mjpython, _viewer_kind
+import torch
+
+from escape_room.play import (
+    _checkpoint_uses_scalar_std,
+    _needs_mjpython,
+    _relaunch_with_mjpython,
+    _viewer_kind,
+)
 
 
 def test_interactive_macos_playback_relaunches_under_mjpython():
@@ -72,3 +79,19 @@ def test_mjpython_relaunch_adds_uv_base_python_library_path(
             "model_29.pt",
         ],
     }
+
+
+def test_legacy_scalar_std_checkpoint_is_detected(tmp_path):
+    scalar = tmp_path / "scalar.pt"
+    log = tmp_path / "log.pt"
+    torch.save(
+        {"actor_state_dict": {"distribution.std_param": torch.ones(8)}},
+        scalar,
+    )
+    torch.save(
+        {"actor_state_dict": {"distribution.log_std_param": torch.zeros(8)}},
+        log,
+    )
+
+    assert _checkpoint_uses_scalar_std(scalar)
+    assert not _checkpoint_uses_scalar_std(log)

@@ -8,6 +8,17 @@ def _pose(x: float, y: float, z: float) -> torch.Tensor:
     return torch.tensor([[x, y, z, 1.0, 0.0, 0.0, 0.0]])
 
 
+def test_inactive_cube_slots_do_not_fill_contact_buffer():
+    env = make_env(num_envs=1, device="cpu", seed=7, play=True)
+    try:
+        env.reset()
+        env.step(torch.zeros(1, 8))
+
+        assert int(env.sim.data.nacon[0]) < 32
+    finally:
+        env.close()
+
+
 def test_grab_acquire_move_release_and_reset():
     env = make_env(num_envs=1, device="cpu", seed=7, play=True)
     try:

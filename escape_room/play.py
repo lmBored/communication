@@ -248,6 +248,12 @@ def _relaunch_with_mjpython(
     )
 
 
+def _checkpoint_uses_scalar_std(path: str | Path) -> bool:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    actor_state = checkpoint.get("actor_state_dict", {})
+    return "distribution.std_param" in actor_state
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the real MuJoCo 3D viewer and optionally record its RGB output."""
     args = parse_args(argv)
@@ -277,6 +283,8 @@ def main(argv: list[str] | None = None) -> None:
         viewer_height=args.height,
     )
     runner_cfg = escape_room_ppo_runner_cfg()
+    if args.ckpt and _checkpoint_uses_scalar_std(args.ckpt):
+        runner_cfg.actor.distribution_cfg["std_type"] = "scalar"
     wrapped = RslRlVecEnvWrapper(env, clip_actions=runner_cfg.clip_actions)
 
     if args.ckpt:
