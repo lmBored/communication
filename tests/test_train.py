@@ -6,7 +6,7 @@ def test_training_defaults_fit_a_40_gib_a100():
     args = parse_args([])
 
     assert args.task == "escape-room"
-    assert args.num_envs == DEFAULT_NUM_ENVS == 8192
+    assert args.num_envs == DEFAULT_NUM_ENVS == 32768
     assert not args.compile_game
     assert args.steps_per_update == 16
     assert args.physics_substeps == 1

@@ -260,13 +260,6 @@ class EscapeRoomAction(ActionTerm):
                 [getattr(e.data.indexing, attr) for e in entities]
             ).to(device=self.device, dtype=torch.long)
 
-        def body_ids(entities) -> torch.Tensor:
-            return torch.tensor(
-                [e.data.indexing.root_body_id for e in entities],
-                device=self.device,
-                dtype=torch.long,
-            )
-
         def mocap_ids(entities) -> torch.Tensor:
             return torch.tensor(
                 [e.data.indexing.mocap_id for e in entities],
@@ -280,7 +273,6 @@ class EscapeRoomAction(ActionTerm):
         self._agent_v_flat = free_joint_adr(
             self._agents, "free_joint_v_adr"
         ).reshape(-1)
-        self._agent_body_ids = body_ids(self._agents)
 
         self._cube_q_flat = free_joint_adr(
             self._cubes, "free_joint_q_adr"
@@ -288,7 +280,6 @@ class EscapeRoomAction(ActionTerm):
         self._cube_v_flat = free_joint_adr(
             self._cubes, "free_joint_v_adr"
         ).reshape(-1)
-        self._cube_body_ids = body_ids(self._cubes)
 
         self._door_mocap_ids = mocap_ids(self._doors)
         self._button_mocap_ids = mocap_ids(self._buttons)
@@ -435,15 +426,19 @@ class EscapeRoomAction(ActionTerm):
 
     def _agent_pose(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._pose_cache is None:
-            data = self._sim_data
-            pos = data.xpos[:, self._agent_body_ids]
-            yaw = _yaw_from_quat(data.xquat[:, self._agent_body_ids])
+            pose = self._sim_data.qpos[:, self._agent_q_flat].view(
+                self.num_envs, NUM_AGENTS, 7
+            )
+            pos = pose[..., :3]
+            yaw = _yaw_from_quat(pose[..., 3:7])
             self._pose_cache = (pos, yaw)
         return self._pose_cache
 
     def _cube_positions(self) -> torch.Tensor:
         if self._cube_pos_cache is None:
-            self._cube_pos_cache = self._sim_data.xpos[:, self._cube_body_ids]
+            self._cube_pos_cache = self._sim_data.qpos[:, self._cube_q_flat].view(
+                self.num_envs, self._num_cubes, 7
+            )[..., :3]
         return self._cube_pos_cache
 
     def _sync_cube_slots(self) -> torch.Tensor:
@@ -626,6 +621,19 @@ class EscapeRoomAction(ActionTerm):
         self._mean_progress_delta = self.progress_delta.mean(-1)
         return self._mean_progress_delta
 
+    def combined_reward(self) -> torch.Tensor:
+        mean_progress = self.consume_progress_reward()
+        pos, _ = self._agent_pose()
+        partner_dist_sq = (pos[:, 0, :2] - pos[:, 1, :2]).square().sum(-1)
+        partner_scale = (
+            partner_dist_sq < PARTNER_CLOSE_THRESHOLD * PARTNER_CLOSE_THRESHOLD
+        ).float()
+        return (
+            mean_progress
+            * (PROGRESS_REWARD_WEIGHT + partner_scale * PARTNER_REWARD_WEIGHT)
+            + SLACK_REWARD_WEIGHT
+        )
+
 
 def game_term(env) -> EscapeRoomAction:
     return env.action_manager.get_term("game")
@@ -648,6 +656,10 @@ def partner_bonus(env) -> torch.Tensor:
     pos, _ = game._agent_pose()
     close = torch.linalg.vector_norm(pos[:, 0, :2] - pos[:, 1, :2], dim=-1) < PARTNER_CLOSE_THRESHOLD
     return close.float() * game._mean_progress_delta
+
+
+def combined_reward(env) -> torch.Tensor:
+    return game_term(env).combined_reward()
 
 
 PROGRESS_REWARD_WEIGHT = REWARD_PER_DIST

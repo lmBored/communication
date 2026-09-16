@@ -1,5 +1,8 @@
 """Construction and registration helpers for the mjlab environment."""
 
+import torch
+from mjlab.envs import ManagerBasedRlEnv
+
 from escape_room.env_cfg import (
     DEFAULT_COMPILE_GAME,
     DEFAULT_NCONMAX,
@@ -11,6 +14,71 @@ from escape_room.env_cfg import (
     ENV_ID,
     escape_room_env_cfg,
 )
+
+
+class EscapeRoomRlEnv(ManagerBasedRlEnv):
+    """Manager environment optimized for direct root-state observations.
+
+    The escape room has no MuJoCo sensor observations, and all dynamic objects
+    read by the game layer are root free bodies. Their post-integration world
+    poses are therefore available directly in qpos, so the extra forward and
+    sense graphs in the generic manager step are unnecessary during training.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._game_term = self.action_manager.get_term("game")
+        self._fast_env_ids = torch.arange(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.reset_time_outs = self.termination_manager.time_outs
+        self.reset_terminated = self.termination_manager.terminated
+        self.reset_buf = self.reset_time_outs
+
+    def step(self, action: torch.Tensor):
+        if not self.cfg.auto_reset and torch.any(self._manual_reset_pending):
+            pending_ids = self._manual_reset_pending.nonzero(
+                as_tuple=False
+            ).squeeze(-1)
+            raise RuntimeError(
+                f"Environments {pending_ids.cpu().tolist()} must be reset via "
+                "reset(env_ids=...) before calling step() again when auto_reset=False."
+            )
+
+        self.extras["log"] = dict()
+        self._game_term.process_actions(action)
+
+        for _ in range(self.cfg.decimation):
+            self._sim_step_counter += 1
+            self._game_term.apply_actions()
+            self.sim.step()
+
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
+        time_out = self.common_step_counter % self.max_episode_length == 0
+        self.reset_time_outs.fill_(time_out)
+        self.reset_terminated.zero_()
+        self.reset_buf = self.reset_time_outs
+        self.termination_manager._term_dones["time_out"].fill_(time_out)
+        self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
+
+        reset_env_ids = self._fast_env_ids if time_out else None
+        if self.cfg.auto_reset and reset_env_ids is not None:
+            self._reset_idx(reset_env_ids)
+
+        self.obs_buf = {"actor": self._game_term.observation()}
+        self.observation_manager._obs_buffer = self.obs_buf
+
+        if not self.cfg.auto_reset and reset_env_ids is not None:
+            self._manual_reset_pending[reset_env_ids] = True
+
+        return (
+            self.obs_buf,
+            self.reward_buf,
+            self.reset_terminated,
+            self.reset_time_outs,
+            self.extras,
+        )
 
 
 def make_env(
@@ -28,10 +96,9 @@ def make_env(
     solver_ls_iterations: int = DEFAULT_SOLVER_LS_ITERATIONS,
     broadphase: str | None = None,
     compile_game: bool = DEFAULT_COMPILE_GAME,
+    fast_step: bool | None = None,
 ):
     """Construct the primary MuJoCo-Warp environment."""
-    from mjlab.envs import ManagerBasedRlEnv
-
     cfg = escape_room_env_cfg(
         play=play,
         num_envs=num_envs,
@@ -48,7 +115,10 @@ def make_env(
         cfg.viewer.width = viewer_width
     if viewer_height is not None:
         cfg.viewer.height = viewer_height
-    return ManagerBasedRlEnv(cfg=cfg, device=device, render_mode=render_mode)
+    if fast_step is None:
+        fast_step = not play and render_mode is None
+    env_cls = EscapeRoomRlEnv if fast_step else ManagerBasedRlEnv
+    return env_cls(cfg=cfg, device=device, render_mode=render_mode)
 
 
 def register_env():

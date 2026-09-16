@@ -82,6 +82,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="fuse the observation math with torch.compile",
     )
+    p.add_argument(
+        "--base-step",
+        action="store_true",
+        help="use mjlab's generic post-step forward/sense path",
+    )
     p.add_argument("--device", type=str, default="cuda:0")
     return p.parse_args()
 
@@ -109,6 +114,7 @@ def main() -> None:
             solver_ls_iterations=args.solver_ls_iterations,
             broadphase=args.broadphase,
             compile_game=args.compile_game,
+            fast_step=not args.base_step,
         )
         action_shape = (args.num_envs, env.action_manager.total_action_dim)
         env.reset()
@@ -172,6 +178,7 @@ def main() -> None:
         f"solver_ls_iterations={args.solver_ls_iterations} "
         f"broadphase={args.broadphase} "
         f"compile_game={args.compile_game} "
+        f"base_step={args.base_step} "
         f"wall_s={elapsed:.3f}"
     )
     print(

@@ -63,6 +63,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="fuse the escape-room observation math with torch.compile",
     )
     p.add_argument(
+        "--base-step",
+        action="store_true",
+        help="use mjlab's generic post-step forward/sense path",
+    )
+    p.add_argument(
         "--check-nans",
         action="store_true",
         help="enable synchronization-heavy per-transition rsl-rl NaN checks",
@@ -142,6 +147,7 @@ def main(argv: list[str] | None = None) -> None:
                 seed=args.seed,
                 physics_substeps=args.physics_substeps,
                 compile_game=args.compile_game,
+                fast_step=not args.base_step,
             )
         else:
             env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
@@ -162,6 +168,7 @@ def main(argv: list[str] | None = None) -> None:
             f"steps/update={args.steps_per_update} updates={args.num_updates} "
             f"physics_substeps={args.physics_substeps} "
             f"compile_game={args.compile_game} "
+            f"base_step={args.base_step} "
             f"check_nans={args.check_nans}"
         )
         start = time.perf_counter()

@@ -12,14 +12,9 @@ from mjlab.viewer import ViewerConfig
 
 from escape_room.consts import DELTA_T, EPISODE_LEN, TOTAL_ACTION_DIM
 from escape_room.mjlab_env import (
-    PARTNER_REWARD_WEIGHT,
-    PROGRESS_REWARD_WEIGHT,
-    SLACK_REWARD_WEIGHT,
     EscapeRoomActionCfg,
-    partner_bonus,
+    combined_reward,
     policy_observation,
-    progress_reward,
-    slack_reward,
 )
 from escape_room.mdp.observations import compute_obs_dim
 from escape_room.scene import make_scene_entities
@@ -50,11 +45,10 @@ DEFAULT_SOLVER_LS_ITERATIONS = 5
 # measured win is confirmed on the target GPU; enable with ``--compile-game``.
 DEFAULT_COMPILE_GAME = False
 
-# Profiled default for a 40 GiB A100. With the batched game layer the scene is
-# far cheaper per world, so 8192 worlds train comfortably (~26 GiB free at the
-# end of a run) and deliver ~4x the throughput of the previous 1024 default.
-# 16384 worlds still fit (~13 GiB free) but leave little headroom.
-DEFAULT_NUM_ENVS = 8192
+# Profiled default for a 40 GiB A100. The specialized synchronous training step
+# leaves about 8 GiB free with 32768 worlds and a 16-step rollout. Larger world
+# counts or a 32-step rollout leave too little headroom for robust submissions.
+DEFAULT_NUM_ENVS = 32768
 
 # Seed
 DEFAULT_SEED = 42
@@ -104,13 +98,7 @@ def escape_room_env_cfg(
             )
         },
         rewards={
-            "progress": RewardTermCfg(
-                func=progress_reward, weight=PROGRESS_REWARD_WEIGHT
-            ),
-            "slack": RewardTermCfg(func=slack_reward, weight=SLACK_REWARD_WEIGHT),
-            "partner": RewardTermCfg(
-                func=partner_bonus, weight=PARTNER_REWARD_WEIGHT
-            ),
+            "total": RewardTermCfg(func=combined_reward, weight=1.0),
         },
         terminations={
             "time_out": TerminationTermCfg(func=time_out, time_out=True),

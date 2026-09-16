@@ -1,5 +1,7 @@
+import pytest
 import torch
 
+from escape_room.consts import PARTNER_BONUS_MULT, REWARD_PER_DIST, SLACK_REWARD
 from escape_room.env import make_env
 from escape_room.mjlab_env import game_term
 
@@ -58,5 +60,28 @@ def test_grab_acquire_move_release_and_reset():
         game.held_cube[0, 0] = 0
         env.reset(env_ids=env_id)
         assert game.held_cube.tolist() == [[-1, -1]]
+    finally:
+        env.close()
+
+
+def test_combined_reward_preserves_progress_slack_and_partner_formula():
+    env = make_env(num_envs=1, device="cpu", seed=7, play=True)
+    try:
+        env.reset()
+        game = game_term(env)
+        env_id = torch.tensor([0], dtype=torch.long)
+        game._agents[0].data.write_root_pose(_pose(0.0, 2.0, 0.5), env_id)
+        game._agents[1].data.write_root_pose(_pose(0.0, 3.0, 0.5), env_id)
+        game.progress_max_y[0] = torch.tensor([1.0, 2.0])
+        game._invalidate_cache()
+
+        reward = env.reward_manager.compute(dt=env.step_dt)
+
+        expected = (
+            REWARD_PER_DIST
+            + REWARD_PER_DIST * PARTNER_BONUS_MULT
+            + SLACK_REWARD
+        )
+        assert reward.item() == pytest.approx(expected)
     finally:
         env.close()
