@@ -55,6 +55,31 @@ GRAB_RAY_LENGTH: float = 2.0     # Max distance for grab raycast
 GRAB_OFFSET_FWD: float = 1.25    # Forward offset from agent center for grab anchor
 GRAB_OFFSET_UP: float = 0.5      # Up offset from agent center for grab anchor
 
+# Physical cube bodies per room.  Every recipe in level_gen.py puts buttons in
+# slots 0..1 and cubes in at most slots 2..4, so slot 5 can never hold a cube.
+# Each entry maps a room index to the entity slots backed by a real free body;
+# unmapped slots stay observation-only, which keeps the dynamic body count (and
+# therefore broadphase, constraint and integration work) at what levels use.
+CUBE_SLOT_LAYOUTS: dict[str, tuple[tuple[int, ...], ...]] = {
+    # 12 cubes: the original allocation, three of which are always inactive.
+    "legacy": tuple((2, 3, 4, 5) for _ in range(NUM_ROOMS)),
+    # 9 cubes: the most any single room recipe can activate.
+    "recipe": tuple((2, 3, 4) for _ in range(NUM_ROOMS)),
+    # 5 cubes: exactly what generate_level's fixed room sequence uses.
+    "fixed": ((), (2, 3, 4), (2, 3)),
+}
+# Measured on an A100 at 8192 worlds: 12 cubes reach 638k rollout-only env SPS,
+# 9 reach 782k and 5 reach 991k, with identical gameplay for the fixed room
+# sequence, so the 5-cube layout is the default.
+DEFAULT_CUBE_LAYOUT: str = "fixed"
+
+# Game systems backend: "warp" runs the fused kernels in warp_game.py,
+# "torch" the eager PyTorch implementation in mjlab_env.py.  Measured on an
+# A100 at 8192 worlds: the fused kernels reach 1,146k rollout-only env SPS
+# against 984k eager, and 1,133k against 912k end-to-end trainer env SPS.
+GAME_BACKENDS: tuple[str, ...] = ("warp", "torch")
+DEFAULT_GAME_BACKEND: str = "warp"
+
 # Entity types (matching EntityType enum from types.hpp)
 class EntityType:
     NONE = 0

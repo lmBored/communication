@@ -14,7 +14,13 @@ from pathlib import Path
 
 import torch
 
-from escape_room.consts import NUM_AGENTS
+from escape_room.consts import (
+    CUBE_SLOT_LAYOUTS,
+    DEFAULT_CUBE_LAYOUT,
+    DEFAULT_GAME_BACKEND,
+    GAME_BACKENDS,
+    NUM_AGENTS,
+)
 from escape_room.env_cfg import DEFAULT_NUM_ENVS
 
 
@@ -38,6 +44,13 @@ def _is_cuda_oom(error: RuntimeError) -> bool:
     return "out of memory" in message and ("cuda" in message or "warp" in message)
 
 
+# Sharing the actor/critic observation preprocessing (one normalizer, no
+# single-group concatenation) was implemented and measured on an A100 at 32768
+# worlds: 1,111,260 against 1,117,644 trainer env SPS, i.e. inside the 0.8%
+# run-to-run spread. It was therefore dropped rather than kept as a patch over
+# rsl-rl internals.
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Train escape room agents with mjlab (MuJoCo Warp) + rsl-rl"
@@ -58,14 +71,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="MuJoCo steps per 0.04 s control step (default: 1)",
     )
     p.add_argument(
-        "--compile-game",
-        action="store_true",
-        help="fuse the escape-room observation math with torch.compile",
-    )
-    p.add_argument(
         "--base-step",
         action="store_true",
         help="use mjlab's generic post-step forward/sense path",
+    )
+    p.add_argument(
+        "--cube-layout",
+        choices=sorted(CUBE_SLOT_LAYOUTS),
+        default=DEFAULT_CUBE_LAYOUT,
+        help="which entity slots get physical cube bodies",
+    )
+    p.add_argument(
+        "--game-backend",
+        choices=GAME_BACKENDS,
+        default=DEFAULT_GAME_BACKEND,
+        help="fused Warp game kernels or the eager PyTorch fallback",
     )
     p.add_argument(
         "--check-nans",
@@ -146,7 +166,8 @@ def main(argv: list[str] | None = None) -> None:
                 device=device,
                 seed=args.seed,
                 physics_substeps=args.physics_substeps,
-                compile_game=args.compile_game,
+                cube_layout=args.cube_layout,
+                game_backend=args.game_backend,
                 fast_step=not args.base_step,
             )
         else:
@@ -167,7 +188,8 @@ def main(argv: list[str] | None = None) -> None:
             f"mjlab/mjwarp+rsl-rl training: task={args.task} envs={args.num_envs} "
             f"steps/update={args.steps_per_update} updates={args.num_updates} "
             f"physics_substeps={args.physics_substeps} "
-            f"compile_game={args.compile_game} "
+            f"cube_layout={args.cube_layout} "
+            f"game_backend={args.game_backend} "
             f"base_step={args.base_step} "
             f"check_nans={args.check_nans}"
         )

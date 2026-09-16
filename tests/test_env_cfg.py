@@ -15,8 +15,8 @@ def test_fast_training_config_reuses_actor_observations_for_critic():
     assert runner_cfg.actor.distribution_cfg["std_type"] == "log"
     assert cfg.decimation == 1
     assert cfg.sim.mujoco.timestep == pytest.approx(CONTROL_DT)
-    assert cfg.sim.nconmax == 96
-    assert cfg.sim.njmax == 384
+    assert cfg.sim.nconmax == 48
+    assert cfg.sim.njmax == 192
     assert cfg.sim.mujoco.iterations == 10
     assert cfg.sim.mujoco.ls_iterations == 5
 

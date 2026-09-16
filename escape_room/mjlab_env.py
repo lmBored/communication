@@ -18,6 +18,8 @@ from escape_room.consts import (
     AGENT_SPAWN_Y_MAX,
     AGENT_SPAWN_Y_MIN,
     BUTTON_WIDTH,
+    DEFAULT_CUBE_LAYOUT,
+    DEFAULT_GAME_BACKEND,
     DOOR_CLOSED_Z,
     DOOR_OPEN_Z,
     DOOR_SPEED,
@@ -42,8 +44,9 @@ from escape_room.consts import (
 from escape_room.level_gen import generate_level
 from escape_room.scene import (
     BUTTON_ENTITY_NAMES,
-    CUBE_ENTITY_NAMES,
     DOOR_ENTITY_NAMES,
+    cube_entity_names,
+    cube_slot_pairs,
 )
 
 
@@ -167,8 +170,10 @@ class EscapeRoomActionCfg(ActionTermCfg):
 
     max_speed: float = 8.0
     max_yaw_rate: float = 4.0
-    compile_game: bool = False
-    """Compile the observation math with ``torch.compile`` (static shapes)."""
+    cube_layout: str = DEFAULT_CUBE_LAYOUT
+    """Which entity slots are backed by physical cube bodies."""
+    game_backend: str = DEFAULT_GAME_BACKEND
+    """``warp`` runs the fused game kernels, ``torch`` the eager fallback."""
 
     def build(self, env):
         return EscapeRoomAction(self, env)
@@ -188,7 +193,10 @@ class EscapeRoomAction(ActionTerm):
         self._agents = [env.scene[f"agent_{idx}"] for idx in range(NUM_AGENTS)]
         self._doors = [env.scene[name] for name in DOOR_ENTITY_NAMES]
         self._buttons = [env.scene[name] for name in BUTTON_ENTITY_NAMES]
-        self._cubes = [env.scene[name] for name in CUBE_ENTITY_NAMES]
+        self._cube_slots = cube_slot_pairs(cfg.cube_layout)
+        self._cubes = [
+            env.scene[name] for name in cube_entity_names(cfg.cube_layout)
+        ]
 
         self.entity_active = torch.zeros(
             self.num_envs,
@@ -197,7 +205,7 @@ class EscapeRoomAction(ActionTerm):
             dtype=torch.bool,
             device=self.device,
         )
-        self.entity_type = torch.zeros_like(self.entity_active, dtype=torch.long)
+        self.entity_type = torch.zeros_like(self.entity_active, dtype=torch.int32)
         self.entity_pos = torch.zeros(
             self.num_envs,
             NUM_ROOMS,
@@ -216,7 +224,7 @@ class EscapeRoomAction(ActionTerm):
         )
         self.door_pos[..., 2] = DOOR_CLOSED_Z
         self.held_cube = torch.full(
-            (self.num_envs, NUM_AGENTS), -1, dtype=torch.long, device=self.device
+            (self.num_envs, NUM_AGENTS), -1, dtype=torch.int32, device=self.device
         )
         self._grab_was_down = torch.zeros(
             self.num_envs, NUM_AGENTS, dtype=torch.bool, device=self.device
@@ -236,14 +244,26 @@ class EscapeRoomAction(ActionTerm):
         self.progress_delta = torch.zeros_like(self.progress_max_y)
         self._mean_progress_delta = torch.zeros(self.num_envs, device=self.device)
         self._slack = torch.ones(self.num_envs, device=self.device)
+        self._entity_pos_flat = self.entity_pos.view(
+            self.num_envs, NUM_ROOMS * MAX_ENTITIES_PER_ROOM, 3
+        )
+        self._entity_active_flat = self.entity_active.view(self.num_envs, -1)
+        self._cube_entity_flat = torch.tensor(
+            [room * MAX_ENTITIES_PER_ROOM + slot for room, slot in self._cube_slots],
+            device=self.device,
+            dtype=torch.long,
+        )
         self._pose_cache: tuple[torch.Tensor, torch.Tensor] | None = None
         self._cube_pos_cache: torch.Tensor | None = None
         self._cube_slots_synced = False
         self._build_index_tables()
         self._build_level_pool()
-        self._observation_fn = _observation_impl
-        if cfg.compile_game:
-            self._observation_fn = torch.compile(_observation_impl, dynamic=False)
+        if cfg.game_backend not in ("warp", "torch"):
+            raise ValueError(
+                f"unknown game backend {cfg.game_backend!r}; use 'warp' or 'torch'"
+            )
+        self._use_warp = cfg.game_backend == "warp"
+        self._warp: object | None = None
 
     def _build_index_tables(self) -> None:
         """Cache flat indices so every body is read/written in one batched op.
@@ -295,6 +315,14 @@ class EscapeRoomAction(ActionTerm):
         self._cube_pos_cache = None
         self._cube_slots_synced = False
 
+    def _warp_game(self):
+        """Bind the fused kernels lazily; the env buffers exist after setup."""
+        if self._warp is None:
+            from escape_room.warp_game import WarpGame
+
+            self._warp = WarpGame(self)
+        return self._warp
+
     @property
     def action_dim(self) -> int:
         return TOTAL_ACTION_DIM
@@ -309,12 +337,13 @@ class EscapeRoomAction(ActionTerm):
             pool_size, NUM_ROOMS, MAX_ENTITIES_PER_ROOM, 3, dtype=torch.float32
         )
         types = torch.zeros(
-            pool_size, NUM_ROOMS, MAX_ENTITIES_PER_ROOM, dtype=torch.long
+            pool_size, NUM_ROOMS, MAX_ENTITIES_PER_ROOM, dtype=torch.int32
         )
         active = torch.zeros_like(types, dtype=torch.bool)
         button_mask = torch.zeros_like(active)
         persistent = torch.zeros(pool_size, NUM_ROOMS, dtype=torch.bool)
         doors = torch.zeros(pool_size, NUM_ROOMS, 3, dtype=torch.float32)
+        allowed = set(self._cube_slots)
         for pool_idx in range(pool_size):
             rooms = generate_level(random.Random(0xE5CA9E + pool_idx))
             for room_idx, room in enumerate(rooms):
@@ -323,6 +352,16 @@ class EscapeRoomAction(ActionTerm):
                 )
                 persistent[pool_idx, room_idx] = room.is_persistent
                 for slot_idx, slot in enumerate(room.entities):
+                    if (
+                        slot.active
+                        and int(slot.type) == int(EntityType.CUBE)
+                        and (room_idx, slot_idx) not in allowed
+                    ):
+                        raise ValueError(
+                            f"cube layout {self.cfg.cube_layout!r} has no physical "
+                            f"body for room {room_idx} slot {slot_idx}; extend "
+                            "CUBE_SLOT_LAYOUTS before generating such levels"
+                        )
                     pos[pool_idx, room_idx, slot_idx] = torch.tensor(
                         [slot.pos_x, slot.pos_y, slot.pos_z]
                     )
@@ -415,9 +454,10 @@ class EscapeRoomAction(ActionTerm):
         )
         self._write_mocap_bodies(self._button_mocap_ids, ids, button_pos)
 
-        cube_pos = slots[:, :, 2:6].reshape(count, -1, 3).clone()
+        slots_flat = slots.reshape(count, -1, 3)
+        cube_pos = slots_flat[:, self._cube_entity_flat].clone()
         cube_pos[..., 2] = torch.where(
-            active[:, :, 2:6].reshape(count, -1), 0.80, -10.0
+            active.reshape(count, -1)[:, self._cube_entity_flat], 0.80, -10.0
         )
         self._write_free_bodies(
             self._cube_q_flat, self._cube_v_flat, ids, cube_pos
@@ -444,9 +484,7 @@ class EscapeRoomAction(ActionTerm):
     def _sync_cube_slots(self) -> torch.Tensor:
         cube_pos = self._cube_positions()
         if not self._cube_slots_synced:
-            self.entity_pos[:, :, 2:6] = cube_pos.view(
-                self.num_envs, NUM_ROOMS, -1, 3
-            )
+            self._entity_pos_flat[:, self._cube_entity_flat] = cube_pos
             self._cube_slots_synced = True
         return cube_pos
 
@@ -457,7 +495,7 @@ class EscapeRoomAction(ActionTerm):
         button_xy = self.entity_pos[:, :, 0:2, :2].unsqueeze(-2)
         agent_xy = agent_pos[..., :2].view(self.num_envs, 1, 1, NUM_AGENTS, 2)
         cube_xy = cube_pos[..., :2].view(self.num_envs, 1, 1, self._num_cubes, 2)
-        cube_active = self.entity_active[:, :, 2:6].reshape(
+        cube_active = self._entity_active_flat[:, self._cube_entity_flat].view(
             self.num_envs, 1, 1, -1
         )
         agent_hit = ((agent_xy - button_xy).square().sum(-1) <= radius_sq).any(-1)
@@ -471,7 +509,9 @@ class EscapeRoomAction(ActionTerm):
         required = self.door_button_mask
         satisfied = (~required) | self.button_pressed
         requested = satisfied.all(-1) & required.any(-1)
-        self.door_open = requested | (self.door_open & self.door_persistent)
+        torch.logical_or(
+            requested, self.door_open & self.door_persistent, out=self.door_open
+        )
         dz = DOOR_SPEED * self._env.step_dt
         target = torch.where(
             self.door_open,
@@ -485,7 +525,9 @@ class EscapeRoomAction(ActionTerm):
         self._grab_was_down.copy_(grab_down)
         agent_pos, yaw = self._agent_pose()
         cube_pos = self._cube_positions()
-        cube_active = self.entity_active[:, :, 2:6].reshape(self.num_envs, 1, -1)
+        cube_active = self._entity_active_flat[:, self._cube_entity_flat].view(
+            self.num_envs, 1, -1
+        )
         held = self.held_cube
         was_holding = held >= 0
         current = torch.where(
@@ -521,8 +563,13 @@ class EscapeRoomAction(ActionTerm):
     def process_actions(self, actions: torch.Tensor) -> None:
         self._invalidate_cache()
         self._raw_actions.copy_(actions)
-        self._processed_actions.copy_(actions.clamp(-1.0, 1.0))
-        shaped = self._processed_actions.view(self.num_envs, NUM_AGENTS, ACTION_DIM_PER_AGENT)
+        torch.clamp(actions, -1.0, 1.0, out=self._processed_actions)
+        if self._use_warp:
+            self._warp_game().pre_step()
+            return
+        shaped = self._processed_actions.view(
+            self.num_envs, NUM_AGENTS, ACTION_DIM_PER_AGENT
+        )
         self._update_buttons_and_doors()
         self._update_grab(shaped[..., 3] > 0.0)
 
@@ -585,6 +632,9 @@ class EscapeRoomAction(ActionTerm):
         )
 
     def apply_actions(self) -> None:
+        if self._use_warp:
+            self._warp_game().apply(self.cfg.max_speed, self.cfg.max_yaw_rate)
+            return
         self._invalidate_cache()
         self._apply_agent_controls()
         self._apply_attachments()
@@ -592,11 +642,13 @@ class EscapeRoomAction(ActionTerm):
         self._invalidate_cache()
 
     def observation(self) -> torch.Tensor:
+        if self._use_warp:
+            return self._warp_game().observe()
         self._invalidate_cache()
         agent_pos, yaw = self._agent_pose()
         self._sync_cube_slots()
         steps_left = (EPISODE_LEN - self._env.episode_length_buf).float()
-        return self._observation_fn(
+        return _observation_impl(
             agent_pos,
             yaw,
             self.entity_pos,
@@ -616,12 +668,18 @@ class EscapeRoomAction(ActionTerm):
     def consume_progress_reward(self) -> torch.Tensor:
         agent_pos, _ = self._agent_pose()
         y = agent_pos[..., 1]
-        self.progress_delta = (y - self.progress_max_y).clamp_min(0.0)
-        self.progress_max_y = torch.maximum(self.progress_max_y, y)
-        self._mean_progress_delta = self.progress_delta.mean(-1)
+        torch.sub(y, self.progress_max_y, out=self.progress_delta).clamp_min_(0.0)
+        torch.maximum(self.progress_max_y, y, out=self.progress_max_y)
+        torch.mean(self.progress_delta, -1, out=self._mean_progress_delta)
         return self._mean_progress_delta
 
     def combined_reward(self) -> torch.Tensor:
+        if self._use_warp:
+            return self._warp_game().compute_reward(
+                PROGRESS_REWARD_WEIGHT,
+                PARTNER_REWARD_WEIGHT,
+                SLACK_REWARD_WEIGHT,
+            )
         mean_progress = self.consume_progress_reward()
         pos, _ = self._agent_pose()
         partner_dist_sq = (pos[:, 0, :2] - pos[:, 1, :2]).square().sum(-1)

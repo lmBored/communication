@@ -3,8 +3,8 @@
 import torch
 from mjlab.envs import ManagerBasedRlEnv
 
+from escape_room.consts import DEFAULT_CUBE_LAYOUT, DEFAULT_GAME_BACKEND
 from escape_room.env_cfg import (
-    DEFAULT_COMPILE_GAME,
     DEFAULT_NCONMAX,
     DEFAULT_NJMAX,
     DEFAULT_NUM_ENVS,
@@ -95,7 +95,8 @@ def make_env(
     solver_iterations: int = DEFAULT_SOLVER_ITERATIONS,
     solver_ls_iterations: int = DEFAULT_SOLVER_LS_ITERATIONS,
     broadphase: str | None = None,
-    compile_game: bool = DEFAULT_COMPILE_GAME,
+    cube_layout: str = DEFAULT_CUBE_LAYOUT,
+    game_backend: str = DEFAULT_GAME_BACKEND,
     fast_step: bool | None = None,
 ):
     """Construct the primary MuJoCo-Warp environment."""
@@ -109,7 +110,8 @@ def make_env(
         solver_iterations=solver_iterations,
         solver_ls_iterations=solver_ls_iterations,
         broadphase=broadphase,
-        compile_game=compile_game,
+        cube_layout=cube_layout,
+        game_backend=game_backend,
     )
     if viewer_width is not None:
         cfg.viewer.width = viewer_width

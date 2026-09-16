@@ -10,7 +10,13 @@ from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
 from mjlab.viewer import ViewerConfig
 
-from escape_room.consts import DELTA_T, EPISODE_LEN, TOTAL_ACTION_DIM
+from escape_room.consts import (
+    DEFAULT_CUBE_LAYOUT,
+    DEFAULT_GAME_BACKEND,
+    DELTA_T,
+    EPISODE_LEN,
+    TOTAL_ACTION_DIM,
+)
 from escape_room.mjlab_env import (
     EscapeRoomActionCfg,
     combined_reward,
@@ -36,14 +42,14 @@ CONTROL_DT = DELTA_T  # Control timestep (0.04)
 DEFAULT_PHYSICS_SUBSTEPS = 1
 PHYSICS_DT = CONTROL_DT / DEFAULT_PHYSICS_SUBSTEPS
 DECIMATION = DEFAULT_PHYSICS_SUBSTEPS
-DEFAULT_NCONMAX = 96
-DEFAULT_NJMAX = 384
+# Per-world contact/constraint capacity. The 5-cube scene needs about 23
+# contacts and 12 constraint rows per world, so 48/192 keeps a 2x margin while
+# measuring 6.8% faster than the previous 96/384 at 32768 worlds.
+DEFAULT_NCONMAX = 48
+DEFAULT_NJMAX = 192
 DEFAULT_SOLVER_ITERATIONS = 10
 DEFAULT_SOLVER_LS_ITERATIONS = 5
 
-# Fuse the observation math with ``torch.compile``. Disabled by default until a
-# measured win is confirmed on the target GPU; enable with ``--compile-game``.
-DEFAULT_COMPILE_GAME = False
 
 # Profiled default for a 40 GiB A100. The specialized synchronous training step
 # leaves about 8 GiB free with 32768 worlds and a 16-step rollout. Larger world
@@ -74,14 +80,15 @@ def escape_room_env_cfg(
     solver_iterations: int = DEFAULT_SOLVER_ITERATIONS,
     solver_ls_iterations: int = DEFAULT_SOLVER_LS_ITERATIONS,
     broadphase: str | None = None,
-    compile_game: bool = DEFAULT_COMPILE_GAME,
+    cube_layout: str = DEFAULT_CUBE_LAYOUT,
+    game_backend: str = DEFAULT_GAME_BACKEND,
 ) -> ManagerBasedRlEnvCfg:
     """Build the real MuJoCo-Warp manager environment configuration."""
     if physics_substeps < 1:
         raise ValueError("physics_substeps must be at least 1")
     cfg = ManagerBasedRlEnvCfg(
         scene=SceneCfg(
-            entities=make_scene_entities(),
+            entities=make_scene_entities(cube_layout),
             num_envs=num_envs,
             env_spacing=0.0,
         ),
@@ -94,7 +101,9 @@ def escape_room_env_cfg(
         },
         actions={
             "game": EscapeRoomActionCfg(
-                entity_name="agent_0", compile_game=compile_game
+                entity_name="agent_0",
+                cube_layout=cube_layout,
+                game_backend=game_backend,
             )
         },
         rewards={

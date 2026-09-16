@@ -25,7 +25,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from escape_room.consts import ACTION_DIM_PER_AGENT, NUM_AGENTS  # noqa: E402
+from escape_room.consts import (  # noqa: E402
+    ACTION_DIM_PER_AGENT,
+    CUBE_SLOT_LAYOUTS,
+    DEFAULT_CUBE_LAYOUT,
+    DEFAULT_GAME_BACKEND,
+    GAME_BACKENDS,
+    NUM_AGENTS,
+)
 from escape_room.env_cfg import (  # noqa: E402
     DEFAULT_NCONMAX,
     DEFAULT_NJMAX,
@@ -60,9 +67,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--step-mode",
-        choices=["full", "physics"],
+        choices=["full", "physics", "reset", "phases"],
         default="full",
-        help="full environment step or raw mjwarp physics graphs only",
+        help=(
+            "full environment step, raw mjwarp physics graphs only, "
+            "all-world resets (to size the reset cost against a step), or "
+            "per-phase timings of one full step"
+        ),
     )
     p.add_argument("--nconmax", type=int, default=DEFAULT_NCONMAX)
     p.add_argument("--njmax", type=int, default=DEFAULT_NJMAX)
@@ -78,17 +89,103 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     p.add_argument(
-        "--compile-game",
-        action="store_true",
-        help="fuse the observation math with torch.compile",
-    )
-    p.add_argument(
         "--base-step",
         action="store_true",
         help="use mjlab's generic post-step forward/sense path",
     )
+    p.add_argument(
+        "--cube-layout",
+        choices=sorted(CUBE_SLOT_LAYOUTS),
+        default=DEFAULT_CUBE_LAYOUT,
+        help="which entity slots get physical cube bodies",
+    )
+    p.add_argument(
+        "--game-backend",
+        choices=GAME_BACKENDS,
+        default=DEFAULT_GAME_BACKEND,
+        help="fused Warp game kernels or the eager PyTorch fallback",
+    )
+    p.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="timed repetitions; the median SPS is reported as the result",
+    )
     p.add_argument("--device", type=str, default="cuda:0")
     return p.parse_args()
+
+
+def profile_phases(env, actions: torch.Tensor, num_steps: int, device: str) -> None:
+    """Attribute one full step to game, physics, reward, observation and rest.
+
+    Each phase is synchronized, which inflates the total slightly but shows
+    where the gap between raw physics and a full environment step sits.
+    """
+    game = env.action_manager.get_term("game")
+    decimation = env.cfg.decimation
+    totals = {
+        "process_actions": 0.0,
+        "apply_actions": 0.0,
+        "physics": 0.0,
+        "reward": 0.0,
+        "observation": 0.0,
+        "managers": 0.0,
+    }
+
+    def sync() -> None:
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+
+    with torch.inference_mode():
+        for _ in range(num_steps):
+            sync()
+            mark = time.perf_counter()
+            game.process_actions(actions)
+            sync()
+            totals["process_actions"] += time.perf_counter() - mark
+
+            for _ in range(decimation):
+                mark = time.perf_counter()
+                game.apply_actions()
+                sync()
+                totals["apply_actions"] += time.perf_counter() - mark
+                mark = time.perf_counter()
+                env.sim.step()
+                sync()
+                totals["physics"] += time.perf_counter() - mark
+
+            mark = time.perf_counter()
+            env.episode_length_buf += 1
+            env.reward_manager.compute(dt=env.step_dt)
+            sync()
+            totals["reward"] += time.perf_counter() - mark
+
+            mark = time.perf_counter()
+            game.observation()
+            sync()
+            totals["observation"] += time.perf_counter() - mark
+
+            mark = time.perf_counter()
+            env.termination_manager.compute()
+            sync()
+            totals["managers"] += time.perf_counter() - mark
+
+    # nacon/nefc count the whole batch, so compare them against the per-world
+    # capacity times the world count before tightening the buffers.
+    worlds = env.num_envs
+    print(
+        f"phase=contacts used_nacon={int(env.sim.data.nacon.max())} "
+        f"nacon_capacity={env.cfg.sim.nconmax * worlds} "
+        f"used_nefc={int(env.sim.data.nefc.max())} "
+        f"nefc_capacity={env.cfg.sim.njmax * worlds}"
+    )
+    total = sum(totals.values())
+    for name, seconds in totals.items():
+        print(
+            f"phase={name} ms_per_step={seconds / num_steps * 1000.0:.3f} "
+            f"share_pct={seconds / total * 100.0:.1f}"
+        )
+    print(f"phase=total ms_per_step={total / num_steps * 1000.0:.3f}")
 
 
 def main() -> None:
@@ -113,7 +210,8 @@ def main() -> None:
             solver_iterations=args.solver_iterations,
             solver_ls_iterations=args.solver_ls_iterations,
             broadphase=args.broadphase,
-            compile_game=args.compile_game,
+            cube_layout=args.cube_layout,
+            game_backend=args.game_backend,
             fast_step=not args.base_step,
         )
         action_shape = (args.num_envs, env.action_manager.total_action_dim)
@@ -141,13 +239,26 @@ def main() -> None:
         env.reset()
         substeps = 1
 
-    if args.step_mode == "physics" and args.backend == "kinematic":
-        raise ValueError("--step-mode physics requires a real mjwarp backend")
+    if args.step_mode != "full" and args.backend == "kinematic":
+        raise ValueError(f"--step-mode {args.step_mode} requires a real mjwarp backend")
+
+    if args.step_mode == "phases":
+        if args.backend != "mjlab":
+            raise ValueError("--step-mode phases requires the mjlab backend")
+        phase_actions = 2.0 * torch.rand(action_shape, device=device) - 1.0
+        profile_phases(env, phase_actions, args.num_steps, device)
+        env.close()
+        return
 
     if args.step_mode == "physics":
         def step(actions: torch.Tensor) -> None:
             for _ in range(substeps):
                 env.sim.step()
+    elif args.step_mode == "reset":
+        reset_ids = torch.arange(args.num_envs, dtype=torch.long, device=device)
+
+        def step(actions: torch.Tensor) -> None:
+            env._reset_idx(reset_ids)
     else:
         def step(actions: torch.Tensor) -> None:
             env.step(actions)
@@ -163,13 +274,19 @@ def main() -> None:
     if device.startswith("cuda"):
         torch.cuda.synchronize()
 
-    start = time.perf_counter()
-    rollout(args.num_steps)
-    if device.startswith("cuda"):
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
-
     env_steps = args.num_envs * args.num_steps
+    samples: list[float] = []
+    for repeat in range(max(args.repeats, 1)):
+        start = time.perf_counter()
+        rollout(args.num_steps)
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        samples.append(env_steps / elapsed)
+        print(f"repeat={repeat} wall_s={elapsed:.3f} env_SPS={samples[-1]:,.0f}")
+
+    samples.sort()
+    env_sps = samples[len(samples) // 2]
     print(
         f"backend={args.backend} num_envs={args.num_envs} "
         f"num_steps={args.num_steps} step_mode={args.step_mode} "
@@ -177,14 +294,16 @@ def main() -> None:
         f"njmax={args.njmax} solver_iterations={args.solver_iterations} "
         f"solver_ls_iterations={args.solver_ls_iterations} "
         f"broadphase={args.broadphase} "
-        f"compile_game={args.compile_game} "
+        f"cube_layout={args.cube_layout} "
+        f"game_backend={args.game_backend} "
         f"base_step={args.base_step} "
-        f"wall_s={elapsed:.3f}"
+        f"repeats={len(samples)} "
+        f"spread_pct={(samples[-1] - samples[0]) / env_sps * 100.0:.2f}"
     )
     print(
-        f"rollout_only_env_SPS={env_steps / elapsed:,.0f} "
-        f"rollout_only_agent_SPS={env_steps * agent_count / elapsed:,.0f} "
-        "(simulation only; not trainer SPS)"
+        f"rollout_only_env_SPS={env_sps:,.0f} "
+        f"rollout_only_agent_SPS={env_sps * agent_count:,.0f} "
+        "(median of repeats; simulation only; not trainer SPS)"
     )
     close = getattr(env, "close", None)
     if close is not None:

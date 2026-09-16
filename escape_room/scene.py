@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 from escape_room.consts import (
     AGENT_RADIUS,
     BUTTON_WIDTH,
+    CUBE_SLOT_LAYOUTS,
+    DEFAULT_CUBE_LAYOUT,
     DOOR_WIDTH,
     MAX_ENTITIES_PER_ROOM,
     NUM_AGENTS,
@@ -107,10 +109,35 @@ def get_actuator_names(agent_idx: int) -> list:
 BUTTON_ENTITY_NAMES = [
     f"button_{room}_{slot}" for room in range(NUM_ROOMS) for slot in range(2)
 ]
-CUBE_ENTITY_NAMES = [
-    f"cube_{room}_{slot}" for room in range(NUM_ROOMS) for slot in range(2, 6)
-]
 DOOR_ENTITY_NAMES = [f"door_{room}" for room in range(NUM_ROOMS)]
+
+
+def cube_slot_layout(layout: str = DEFAULT_CUBE_LAYOUT):
+    """Resolve a cube layout name to its per-room entity slot indices."""
+    try:
+        return CUBE_SLOT_LAYOUTS[layout]
+    except KeyError:
+        raise ValueError(
+            f"unknown cube layout {layout!r}; "
+            f"choose from {sorted(CUBE_SLOT_LAYOUTS)}"
+        ) from None
+
+
+def cube_slot_pairs(layout: str = DEFAULT_CUBE_LAYOUT) -> list[tuple[int, int]]:
+    """Return the ``(room, slot)`` pair backing each physical cube body."""
+    return [
+        (room, slot)
+        for room, room_slots in enumerate(cube_slot_layout(layout))
+        for slot in room_slots
+    ]
+
+
+def cube_entity_names(layout: str = DEFAULT_CUBE_LAYOUT) -> list[str]:
+    """Entity names of the physical cube bodies for a layout."""
+    return [f"cube_{room}_{slot}" for room, slot in cube_slot_pairs(layout)]
+
+
+CUBE_ENTITY_NAMES = cube_entity_names()
 
 
 def _spec_from_xml(xml: str):
@@ -208,7 +235,9 @@ def _cube_spec(cube_idx: int):
     )
 
 
-def make_scene_entities() -> dict[str, "EntityCfg"]:
+def make_scene_entities(
+    cube_layout: str = DEFAULT_CUBE_LAYOUT,
+) -> dict[str, "EntityCfg"]:
     """Create the fixed set of independently batched mjlab entities."""
     from mjlab.entity import EntityCfg
 
@@ -223,7 +252,7 @@ def make_scene_entities() -> dict[str, "EntityCfg"]:
         entities[name] = EntityCfg(spec_fn=_door_spec)
     for name in BUTTON_ENTITY_NAMES:
         entities[name] = EntityCfg(spec_fn=_button_spec)
-    for cube_idx, name in enumerate(CUBE_ENTITY_NAMES):
+    for cube_idx, name in enumerate(cube_entity_names(cube_layout)):
         entities[name] = EntityCfg(
             spec_fn=lambda idx=cube_idx: _cube_spec(idx)
         )

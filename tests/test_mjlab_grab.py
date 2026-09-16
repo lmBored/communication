@@ -21,8 +21,11 @@ def test_inactive_cube_slots_do_not_fill_contact_buffer():
         env.close()
 
 
-def test_grab_acquire_move_release_and_reset():
-    env = make_env(num_envs=1, device="cpu", seed=7, play=True)
+@pytest.mark.parametrize("game_backend", ["torch", "warp"])
+def test_grab_acquire_move_release_and_reset(game_backend):
+    env = make_env(
+        num_envs=1, device="cpu", seed=7, play=True, game_backend=game_backend
+    )
     try:
         env.reset()
         game = game_term(env)
@@ -42,7 +45,8 @@ def test_grab_acquire_move_release_and_reset():
         assert game.held_cube.tolist() == [[-1, -1]]
 
         game.process_actions(torch.zeros(1, 8))
-        game.entity_active[0, 0, 2] = True
+        cube_room, cube_slot = game._cube_slots[0]
+        game.entity_active[0, cube_room, cube_slot] = True
         game.process_actions(grab_both)
         assert game.held_cube.tolist() == [[0, -1]]
 
