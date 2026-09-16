@@ -129,7 +129,7 @@ def _communication_panel_lines(
         vector = ", ".join(f"{value:.3f}" for value in values)
         vector_line = f"MESSAGE: [{vector}]"
         if probe is None:
-            decoded = "probe unavailable"
+            decoded = "text unavailable"
         else:
             from escape_room.communication.evaluate import decode_messages
 
@@ -138,7 +138,7 @@ def _communication_panel_lines(
     return (
         "SENDER -> RECEIVER",
         vector_line,
-        f"PROBE (diagnostic only): {decoded}",
+        f"TEXT (Generated manually for interpretation): {decoded}",
     )
 
 
