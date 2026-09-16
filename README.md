@@ -1,5 +1,7 @@
 # Escape Room
 
+<video src="communication.mp4" controls width="100%"></video>
+
 Multi-agent cooperative puzzle environment running on **mjlab + MuJoCo Warp** with continuous controls, procedural rooms, 3D playback, and **rsl-rl PPO** training.
 
 The repository also includes an independent **two-agent Direct DIAL communication scenario**: a fixed sender sees a private left/right arrow, emits a learned continuous vector, and a mobile receiver must enter the matching one of two visible doorways.
