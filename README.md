@@ -2,6 +2,8 @@
 
 Multi-agent cooperative puzzle environment running on **mjlab + MuJoCo Warp** with continuous controls, procedural rooms, 3D playback, and **rsl-rl PPO** training.
 
+The repository also includes an independent **two-agent Direct DIAL communication scenario**: a fixed sender sees a private left/right arrow, emits a learned continuous vector, and a mobile receiver must enter the matching one of two visible doorways.
+
 ## Overview
 
 Two agents navigate through 3 procedural rooms, solving puzzles involving buttons, doors, and cubes to maximize progress:
@@ -122,6 +124,124 @@ python scripts/sim_bench.py --backend cartpole --num-envs 8192 --num-steps 200
 python scripts/train.py --task cartpole --num-envs 8192 --num-updates 30
 ```
 
+## Direct DIAL Communication Scenario
+
+The `communication` task is isolated from the original escape-room environment and registered as `EscapeRoomCommunication-v0`. The clue-holder is fixed in a sealed room with a visible arrow and a private observation `[signed clue, remaining time]`. The receiver starts centered in a separate room with both symmetric doorways in its 120-degree first-person view; its observation contains only local pose/velocity, vectors to both doors, and remaining time.
+
+The actor uses a same-step, one-way, DIAL-inspired differentiable channel:
+
+```mermaid
+flowchart TD
+    S["sender obs [N,2]<br/>signed clue, remaining time"] --> SE["sender MLP 64-64 -> 2"]
+    SE --> M["message = tanh(...) [N,2]"]
+    R["receiver obs [N,12]<br/>pose, velocity, both door vectors, remaining time"] --> RE["receiver MLP 256-256 -> 256 latent"]
+    M --> H["action head<br/>Linear(256+2 -> 3)"]
+    RE --> H
+    H --> A["action [N,3]<br/>forward, strafe, yaw"]
+    S --> C["centralized critic<br/>MLPModel on sender+receiver"]
+    R --> C
+```
+
+Simpler version:
+```mermaid
+flowchart TD
+    S[sender obs: signed clue] --> SE[sender MLP]
+    SE --> M[tanh message 2D]
+    R[receiver obs: pose, both doors] --> RE[receiver MLP latent]
+    M --> H[action head]
+    RE --> H
+    H --> A[forward, strafe, yaw]
+    S --> C[centralized critic]
+    R --> C
+```
+
+### Architecture in detail
+
+**One module, two branches.** `escape_room/communication/model.py::DirectDialActor` replaces rsl-rl's `MLPModel` as the actor. The environment publishes two *separate, private* observation groups (`sender`, `receiver`) plus a `critic` group, and the runner's `obs_groups` maps `actor -> (sender, receiver)`. Inside the actor, the sender branch is the **only** path that touches `sender`, and the receiver branch is the **only** path that produces actions. The two branches meet at a single concatenation: `action_head(cat(receiver_latent, message))`. The message is *not* injected into the receiver's observation tensor. It is concatenated to the receiver's **hidden latent** right before the action head:
+```
+message        = tanh(sender_encoder(sender_obs))        # [N, 2]
+receiver_latent= receiver_encoder(receiver_obs)          # [N, 256]
+action_mean    = action_head(cat(receiver_latent, message))  # Linear(258 -> 3)
+```
+
+**Communication is not an action.** The action space is exactly three continuous values (`forward`, `strafe`, `yaw`) belonging to the receiver only. The message is an internal network activation computed every control step, never stored in PPO's rollout buffer, never clipped by the action manager, and never seen by the physics simulation. It is therefore not optional and not explorable: there is no "stay silent" action; the sender emits a vector on every step, and the only thing PPO can change is *what* that vector encodes.
+
+**Direction and delivery.** Communication is strictly one-way, sender → receiver, within the same timestep. There is no broadcast bus and no observation injection: the message is *not* appended to the receiver's observation tensor, it is concatenated to the receiver's hidden latent immediately before the action head. The receiver cannot communicate back — it has no encoder output routed anywhere except its own action head — so this is a single-channel, single-hop topology rather than a general many-to-many protocol. The clue-holder is also physically frozen, so it has no side channel through the world either.
+
+**How learning reaches the channel.** Nothing supervises the message. PPO's surrogate loss differentiates the receiver's action log-probability with respect to the action head, through the concatenated message, and straight into the sender encoder weights (`tests/test_communication_model.py::test_task_reward_gradient_reaches_sender_encoder` asserts this gradient is non-zero). `tanh` bounds each component to `[-1, 1]`, which keeps the channel numerically stable and makes the learned code easy to read: the trained seeds converge to saturated corners such as `[-1, -1]` = LEFT and `[+1, +1]` = RIGHT.
+
+**Reward is shared and single.** There is one scalar reward per world per step, produced by the environment's reward manager, and both branches are optimized from that same signal — there is no per-agent credit assignment, no sender-specific bonus, and no communication cost term. The critic is centralized: it reads the concatenation of both private groups, which is legal because it is used only for advantage estimation and is discarded at inference.
+
+This direct channel follows the simple end-to-end continuous communication family summarized in [The Five Ws of Multi-Agent Communication](https://arxiv.org/html/2602.11583). It is intentionally DIAL-inspired rather than an exact reproduction of original DIAL's delayed/discretized execution: with one known sender and receiver, attention adds routing machinery without a routing choice.
+
+Terminal rewards delivered to PPO are `+1` for a correct room, `-10` for a wrong room, and `-20` for timeout, plus `-0.01` per step. Correct, wrong, and timeout outcomes are terminated and logged separately at the 100-step horizon.
+
+### Train, evaluate, and record
+
+```bash
+# Local/CUDA training; model_final.pt is always written at completion.
+escape-room-train --task communication --num-envs 32768 --num-updates 1000 \
+  --steps-per-update 16 --message-dim 2 --seed 42 --ckpt-dir ckpts/communication_42
+
+# 4,096 balanced held-out episodes, nearest-centroid probe, and channel ablations.
+# Writes model_final.evaluation.json and model_final.message_probe.json beside the checkpoint.
+escape-room-evaluate --ckpt ckpts/communication_42/model_final.pt \
+  --episodes 4096 --device cuda:0 --seed 42
+
+# Both first-person views side by side, with the raw vector and diagnostic probe below.
+escape-room-play --task communication --policy checkpoint \
+  --ckpt ckpts/communication_42/model_final.pt --headless \
+  --record demos/communication.mp4 --steps 100 --width 480 --height 270
+```
+
+The probe is fitted after training on a balanced calibration split and never affects the policy or reward. Playback automatically loads the checkpoint-adjacent probe; use `--message-probe` to override it. Checkpoint loading infers the learned message width and sender/receiver network widths, so non-default trained architectures remain strict-load compatible.
+
+If the panel shows `PROBE (diagnostic only): probe unavailable`, the recording itself is fine — only the sidecar is missing. The message vector is produced by the actor, but the `LEFT`/`RIGHT` reading needs `<checkpoint>.message_probe.json`, which is written by the evaluation step, not by training. Copy the sidecar next to the checkpoint (`scp <host>:<run-dir>/model_final.message_probe.json ckpts/communication_42/`), point `--message-probe` at it, or regenerate it locally with `escape-room-evaluate --ckpt ... --device cpu --episodes 256`. Each probe belongs to the checkpoint it was fitted on, because the emergent code (which corner means `LEFT`) differs per seed.
+
+### Reproducible Snellius workflow
+
+`hpc/communication.sbatch` supports `test`, `smoke`, `profile`, `train`, `evaluate`, and `record`. `asdf.sh` syncs the source and passes these controls to `snellius.surf.nl`; the job uses CUDA 12.6, `torch 2.7.1+cu126`, an A100-SXM4-40GB, and a dependency-stamped environment protected by a setup lock.
+
+```bash
+SBATCH_SCRIPT=hpc/communication.sbatch MODE=test ./asdf.sh
+SBATCH_SCRIPT=hpc/communication.sbatch MODE=smoke ./asdf.sh
+SBATCH_SCRIPT=hpc/communication.sbatch MODE=profile \
+  PROFILE_COUNTS=4096:8192:16384:32768 PROFILE_UPDATES=10 ./asdf.sh
+
+for seed in 42 43 44; do
+  SBATCH_SCRIPT=hpc/communication.sbatch MODE=train NUM_ENVS=32768 \
+    NUM_UPDATES=1000 STEPS_PER_UPDATE=16 MESSAGE_DIM=2 SEED="$seed" ./asdf.sh
+done
+
+SBATCH_SCRIPT=hpc/communication.sbatch MODE=evaluate EVAL_EPISODES=4096 \
+  SEED=42 CKPT=/home/knguyen2/madrona_escape_room/ckpts/communication_seed_42_job_26811515/model_final.pt ./asdf.sh
+SBATCH_SCRIPT=hpc/communication.sbatch MODE=record SEED=42 \
+  CKPT=/home/knguyen2/madrona_escape_room/ckpts/communication_seed_42_job_26811515/model_final.pt ./asdf.sh
+```
+
+### Measured Snellius results (2026-09-16)
+
+Final local validation was `uv run --no-sync pytest -q`: 48 passed in 8.91 seconds. The CUDA smoke gate was job `26800455`: 256 worlds, three NaN-checked updates, no NaN/Inf, no OOM. Profiling used ten updates and one A100:
+
+| Profile job | Worlds | Trainer env SPS | Trainer agent SPS | Free A100 memory after run |
+|---|---:|---:|---:|---:|
+| `26800530` | 4,096 | 302,603 | 605,206 | 37.39 GiB |
+| `26800676` | 8,192 | 625,996 | 1,251,992 | 35.78 GiB |
+| `26800676` | 16,384 | 1,184,150 | 2,368,301 | 32.47 GiB |
+| `26800676` | 32,768 | **1,881,076** | **3,762,152** | **26.12 GiB** |
+
+The selected production setting is 32,768 worlds, 16 rollout steps, one physics step per 0.04-second control step, five PPO epochs, four minibatches, 256-wide actor/critic layers, a 2D message, and 1,000 updates. All three fixed seeds used the same configuration and were evaluated on 4,096 balanced held-out episodes:
+
+| Seed | Train job | Eval job | Trainer env SPS | Correct | Wrong | Timeout | Probe accuracy | Zero-message success | Shuffled-message success |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 42 | `26811515` | `26812058` | 1,484,490 | 100.00% | 0.00% | 0.00% | 100.00% | 50.00% | 47.05% |
+| 43 | `26811074` | `26811077` | 1,312,271 | 100.00% | 0.00% | 0.00% | 100.00% | 50.00% | 50.15% |
+| 44 | `26811266` | `26811512` | 1,524,719 | 100.00% | 0.00% | 0.00% | 100.00% | 20.39% | 47.63% |
+
+Every seed exceeds the 95% task/probe thresholds with no wrong entries or timeouts. Both interventions reduce success below 60%, demonstrating that the receiver cannot bypass the message channel. Every full training run finished with 26.12 GiB free on the 39.67 GiB A100 and reported no NaN/Inf or OOM.
+
+Artifacts remain on Snellius under `~/madrona_escape_room/ckpts/communication_seed_<seed>_job_<job>/`: `model_final.pt`, TensorBoard logs, `model_final.evaluation.json`, and `model_final.message_probe.json`. Recording job `26812275` produced `~/madrona_escape_room/demos/communication_job_26812275.mp4`: H.264/yuv420p, 960×390, 100 frames at 25 FPS (4 seconds), SHA-256 `0998906e0ba3f24df2e7ebc5e1e1f7a8051d9b19ece6736d11fc8badd69c96f1`.
+
 ### Play / demo (live window)
 
 ```bash
@@ -152,6 +272,7 @@ On macOS, the regular `python scripts/play.py ...` command automatically restart
 
 ```
 escape_room/
+  communication/       # Independent Direct DIAL scene, actor, evaluation, and probe
   consts.py            # Caps / rewards / obs dims
   level_gen.py         # Procedural room recipes
   scene.py             # Fixed-topology MuJoCo entity composition
@@ -166,6 +287,7 @@ scripts/
   sim_bench.py         # Rollout-only simulation benchmark
 hpc/
   comm.sbatch          # Snellius short-training + benchmark job
+  communication.sbatch # Staged communication test/profile/train/evaluate/record job
   optbench.sbatch      # A/B harness: one allocation, many variants
   compare_original.sbatch  # Upstream Madrona head-to-head
 ```
@@ -180,7 +302,7 @@ hpc/
 
 ## Requirements
 
-- Python >= 3.10 and `mjlab>=1.6,<1.7`
+- Python >= 3.10, `mjlab>=1.6,<1.7`, and Pillow
 - NVIDIA GPU required for high-throughput mjwarp training; CPU is supported for light playback/tests
 - `ffmpeg` on PATH to write MP4s
 

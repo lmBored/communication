@@ -969,6 +969,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "mjlab" },
+    { name = "pillow" },
 ]
 
 [package.optional-dependencies]
@@ -980,6 +981,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "mjlab", specifier = ">=1.6.0,<1.7" },
+    { name = "pillow", specifier = ">=12.0" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
 ]

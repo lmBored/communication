@@ -57,7 +57,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--task",
-        choices=["escape-room", "cartpole"],
+        choices=["escape-room", "communication", "cartpole"],
         default="escape-room",
         help="environment to train; cartpole provides a simple-stack baseline",
     )
@@ -106,6 +106,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--ckpt-dir", type=str, default="./ckpts")
     p.add_argument("--save-interval", type=int, default=25)
     p.add_argument("--num-channels", type=int, default=256)
+    p.add_argument(
+        "--message-dim",
+        type=int,
+        default=2,
+        help="continuous sender-to-receiver message width for communication",
+    )
     return p.parse_args(argv)
 
 
@@ -118,7 +124,7 @@ def main(argv: list[str] | None = None) -> None:
     from mjlab.tasks.cartpole import cartpole_balance_env_cfg, cartpole_ppo_runner_cfg
     from mjlab.utils.torch import configure_torch_backends
 
-    from escape_room.env import make_env
+    from escape_room.env import make_env as make_escape_room_env
     from escape_room.env_cfg import escape_room_ppo_runner_cfg
 
     device = args.device
@@ -131,6 +137,12 @@ def main(argv: list[str] | None = None) -> None:
         runner_cfg = escape_room_ppo_runner_cfg()
         env_cfg = None
         agent_count = NUM_AGENTS
+    elif args.task == "communication":
+        from escape_room.communication.env_cfg import communication_ppo_runner_cfg
+
+        runner_cfg = communication_ppo_runner_cfg(message_dim=args.message_dim)
+        env_cfg = None
+        agent_count = 2
     else:
         runner_cfg = cartpole_ppo_runner_cfg()
         env_cfg = cartpole_balance_env_cfg()
@@ -160,8 +172,8 @@ def main(argv: list[str] | None = None) -> None:
     env = None
     try:
         _print_cuda_memory(device, "before_env")
-        if env_cfg is None:
-            env = make_env(
+        if args.task == "escape-room":
+            env = make_escape_room_env(
                 num_envs=args.num_envs,
                 device=device,
                 seed=args.seed,
@@ -169,6 +181,15 @@ def main(argv: list[str] | None = None) -> None:
                 cube_layout=args.cube_layout,
                 game_backend=args.game_backend,
                 fast_step=not args.base_step,
+            )
+        elif args.task == "communication":
+            from escape_room.communication.env import make_env as make_communication_env
+
+            env = make_communication_env(
+                num_envs=args.num_envs,
+                device=device,
+                seed=args.seed,
+                physics_substeps=args.physics_substeps,
             )
         else:
             env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
@@ -190,6 +211,7 @@ def main(argv: list[str] | None = None) -> None:
             f"physics_substeps={args.physics_substeps} "
             f"cube_layout={args.cube_layout} "
             f"game_backend={args.game_backend} "
+            f"message_dim={args.message_dim} "
             f"base_step={args.base_step} "
             f"check_nans={args.check_nans}"
         )
@@ -207,6 +229,9 @@ def main(argv: list[str] | None = None) -> None:
             f"trainer_agent_SPS={total_steps * agent_count / elapsed:,.0f} "
             f"wall_s={elapsed:.3f} (rollout + PPO optimization + logging)"
         )
+        final_checkpoint = ckpt_dir / "model_final.pt"
+        runner.save(str(final_checkpoint))
+        print(f"final_checkpoint={final_checkpoint}")
         _print_cuda_memory(device, "finished")
     except RuntimeError as error:
         if _is_cuda_oom(error):

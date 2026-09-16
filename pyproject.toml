@@ -9,6 +9,7 @@ description = "Multi-agent cooperative puzzle environment powered by mjlab + mjw
 requires-python = ">=3.10"
 dependencies = [
     "mjlab>=1.6.0,<1.7",
+    "pillow>=12.0",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +21,7 @@ dev = [
 [project.scripts]
 escape-room-train = "escape_room.train:main"
 escape-room-play = "escape_room.play:main"
+escape-room-evaluate = "escape_room.communication.evaluate:main"
 
 [tool.setuptools.packages.find]
 include = ["escape_room*"]
