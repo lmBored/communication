@@ -1,6 +1,6 @@
-# Escape Room
+# Communication
 
-<video src="communication.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/d7430988-2484-45f3-8af7-1b3a204cc340
 
 Multi-agent cooperative puzzle environment running on **mjlab + MuJoCo Warp** with continuous controls, procedural rooms, 3D playback, and **rsl-rl PPO** training.
 
