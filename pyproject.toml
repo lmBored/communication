@@ -22,6 +22,7 @@ dev = [
 escape-room-train = "escape_room.train:main"
 escape-room-play = "escape_room.play:main"
 escape-room-evaluate = "escape_room.communication.evaluate:main"
+escape-room-evaluate-twowaycomm = "escape_room.twowaycomm.evaluate:main"
 
 [tool.setuptools.packages.find]
 include = ["escape_room*"]

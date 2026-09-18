@@ -51,13 +51,33 @@ def _is_cuda_oom(error: RuntimeError) -> bool:
 # rsl-rl internals.
 
 
+def _task_banner(args: argparse.Namespace) -> str:
+    """Report only the flags the selected task actually reads."""
+    if args.task == "escape-room":
+        return f"cube_layout={args.cube_layout} game_backend={args.game_backend} "
+    if args.task == "communication":
+        return f"message_dim={args.message_dim} "
+    if args.task == "twowaycomm":
+        sender = args.sender_message_dim or args.message_dim
+        receiver = args.receiver_message_dim or args.message_dim
+        return (
+            f"sender_message_dim={sender} receiver_message_dim={receiver} "
+            f"channel_mode={args.channel_mode} "
+            f"delayed_feedback={not args.no_delayed_feedback} "
+            f"arrow_layout={args.arrow_layout} obs_mode={args.obs_mode} "
+            f"reward_sharing={args.reward_sharing} "
+            f"sender_shaping_weight={args.sender_shaping_weight} "
+        )
+    return ""
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Train escape room agents with mjlab (MuJoCo Warp) + rsl-rl"
     )
     p.add_argument(
         "--task",
-        choices=["escape-room", "communication", "cartpole"],
+        choices=["escape-room", "communication", "twowaycomm", "cartpole"],
         default="escape-room",
         help="environment to train; cartpole provides a simple-stack baseline",
     )
@@ -112,6 +132,56 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=2,
         help="continuous sender-to-receiver message width for communication",
     )
+    p.add_argument(
+        "--sender-message-dim",
+        type=int,
+        default=None,
+        help="twowaycomm sender channel width; defaults to --message-dim. "
+        "Narrowing it stops the sender from broadcasting every arrow direction",
+    )
+    p.add_argument(
+        "--receiver-message-dim",
+        type=int,
+        default=None,
+        help="twowaycomm receiver-to-sender channel width; defaults to --message-dim",
+    )
+    p.add_argument(
+        "--channel-mode",
+        choices=["same_step", "delayed"],
+        default="same_step",
+        help="twowaycomm channel timing; delayed enables a query/response protocol",
+    )
+    p.add_argument(
+        "--no-delayed-feedback",
+        action="store_true",
+        help="with --channel-mode delayed, keep the partner message out of the "
+        "message encoder (a one-step-lagged control, not a dialogue)",
+    )
+    p.add_argument(
+        "--arrow-layout",
+        choices=["front", "scattered"],
+        default="front",
+        help="twowaycomm arrow placement; scattered forces the sender to turn",
+    )
+    p.add_argument(
+        "--obs-mode",
+        choices=["vector", "pixel"],
+        default="vector",
+        help="twowaycomm observation form",
+    )
+    p.add_argument(
+        "--reward-sharing",
+        choices=["shared", "receiver_only"],
+        default="shared",
+        help="twowaycomm reward routing; receiver_only disables sender shaping",
+    )
+    p.add_argument(
+        "--sender-shaping-weight",
+        type=float,
+        default=0.0,
+        help="twowaycomm reward for facing the matching-colour arrow (0 disables, "
+        "which keeps the reward function identical to communication)",
+    )
     return p.parse_args(argv)
 
 
@@ -141,6 +211,19 @@ def main(argv: list[str] | None = None) -> None:
         from escape_room.communication.env_cfg import communication_ppo_runner_cfg
 
         runner_cfg = communication_ppo_runner_cfg(message_dim=args.message_dim)
+        env_cfg = None
+        agent_count = 2
+    elif args.task == "twowaycomm":
+        from escape_room.twowaycomm.env_cfg import twowaycomm_ppo_runner_cfg
+
+        runner_cfg = twowaycomm_ppo_runner_cfg(
+            message_dim=args.message_dim,
+            sender_message_dim=args.sender_message_dim,
+            receiver_message_dim=args.receiver_message_dim,
+            channel_mode=args.channel_mode,
+            delayed_message_feedback=not args.no_delayed_feedback,
+            obs_mode=args.obs_mode,
+        )
         env_cfg = None
         agent_count = 2
     else:
@@ -191,6 +274,19 @@ def main(argv: list[str] | None = None) -> None:
                 seed=args.seed,
                 physics_substeps=args.physics_substeps,
             )
+        elif args.task == "twowaycomm":
+            from escape_room.twowaycomm.env import make_env as make_twowaycomm_env
+
+            env = make_twowaycomm_env(
+                num_envs=args.num_envs,
+                device=device,
+                seed=args.seed,
+                physics_substeps=args.physics_substeps,
+                arrow_layout=args.arrow_layout,
+                reward_sharing=args.reward_sharing,
+                sender_shaping_weight=args.sender_shaping_weight,
+                obs_mode=args.obs_mode,
+            )
         else:
             env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
         _print_cuda_memory(device, "after_env")
@@ -209,10 +305,8 @@ def main(argv: list[str] | None = None) -> None:
             f"mjlab/mjwarp+rsl-rl training: task={args.task} envs={args.num_envs} "
             f"steps/update={args.steps_per_update} updates={args.num_updates} "
             f"physics_substeps={args.physics_substeps} "
-            f"cube_layout={args.cube_layout} "
-            f"game_backend={args.game_backend} "
-            f"message_dim={args.message_dim} "
-            f"base_step={args.base_step} "
+            + _task_banner(args)
+            + f"base_step={args.base_step} "
             f"check_nans={args.check_nans}"
         )
         start = time.perf_counter()
