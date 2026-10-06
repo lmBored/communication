@@ -142,6 +142,64 @@ def _communication_panel_lines(
     )
 
 
+def _twowaycomm_panel_lines(
+    messages: dict[str, np.ndarray] | None,
+) -> tuple[str, ...]:
+    """Both channels, printed one above the other."""
+    if not messages:
+        return ("SENDER -> RECEIVER", "  MESSAGE: unavailable")
+    lines: list[str] = []
+    for label, key in (
+        ("SENDER -> RECEIVER", "sender"),
+        ("RECEIVER -> SENDER", "receiver"),
+    ):
+        lines.append(label)
+        message = messages.get(key)
+        if message is None:
+            lines.append("  MESSAGE: unavailable")
+            continue
+        values = np.asarray(message, dtype=np.float32).reshape(-1)
+        lines.append("  MESSAGE: [" + ", ".join(f"{v:.3f}" for v in values) + "]")
+    return tuple(lines)
+
+
+def _compose_multiview_frame(
+    frames: list[np.ndarray],
+    labels: list[str],
+    lines: tuple[str, ...],
+    panel_height: int | None = None,
+) -> np.ndarray:
+    """Lay first-person views side by side above a text panel."""
+    images = [
+        Image.fromarray(np.asarray(frame, dtype=np.uint8), mode="RGB")
+        for frame in frames
+    ]
+    for index in range(1, len(images)):
+        if images[index].size != images[0].size:
+            images[index] = images[index].resize(images[0].size)
+    width, height = images[0].size
+    if panel_height is None:
+        panel_height = max(COMMUNICATION_PANEL_HEIGHT, 24 + 34 * len(lines))
+    canvas = Image.new("RGB", (width * len(images), height + panel_height))
+    for index, image in enumerate(images):
+        canvas.paste(image, (width * index, 0))
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default(size=16)
+    for index, label in enumerate(labels):
+        draw.rectangle(
+            (width * index, 0, width * (index + 1), 30), fill=(12, 16, 22)
+        )
+        draw.text((width * index + 8, 7), label, fill=(255, 255, 255), font=font)
+    draw.rectangle(
+        (0, height, width * len(images), height + panel_height), fill=(12, 16, 22)
+    )
+    for row, line in enumerate(lines):
+        draw.text(
+            (16, height + 12 + row * 34), line, fill=(238, 241, 246), font=font
+        )
+    return np.asarray(canvas)
+
+
 def _compose_communication_frame(
     sender_frame: np.ndarray,
     receiver_frame: np.ndarray,
@@ -149,38 +207,39 @@ def _compose_communication_frame(
     probe: dict | None,
 ) -> np.ndarray:
     """Compose both first-person views over a communication message panel."""
-    sender = Image.fromarray(np.asarray(sender_frame, dtype=np.uint8), mode="RGB")
-    receiver = Image.fromarray(
-        np.asarray(receiver_frame, dtype=np.uint8), mode="RGB"
+    return _compose_multiview_frame(
+        [sender_frame, receiver_frame],
+        [SENDER_VIEW_LABEL, RECEIVER_VIEW_LABEL],
+        _communication_panel_lines(message, probe),
+        panel_height=COMMUNICATION_PANEL_HEIGHT,
     )
-    if receiver.size != sender.size:
-        receiver = receiver.resize(sender.size)
-    width, height = sender.size
-    canvas = Image.new("RGB", (width * 2, height + COMMUNICATION_PANEL_HEIGHT))
-    canvas.paste(sender, (0, 0))
-    canvas.paste(receiver, (width, 0))
-    draw = ImageDraw.Draw(canvas)
-    font = ImageFont.load_default(size=16)
-    draw.rectangle((0, 0, width, 30), fill=(12, 16, 22))
-    draw.rectangle((width, 0, width * 2, 30), fill=(12, 16, 22))
-    draw.text((8, 7), SENDER_VIEW_LABEL, fill=(255, 255, 255), font=font)
-    draw.text((width + 8, 7), RECEIVER_VIEW_LABEL, fill=(255, 255, 255), font=font)
-    draw.rectangle(
-        (0, height, width * 2, height + COMMUNICATION_PANEL_HEIGHT),
-        fill=(12, 16, 22),
+
+
+def _compose_twowaycomm_frame(
+    sender_frame: np.ndarray,
+    receiver_frame: np.ndarray,
+    messages: dict[str, np.ndarray] | None,
+) -> np.ndarray:
+    return _compose_multiview_frame(
+        [sender_frame, receiver_frame],
+        [SENDER_VIEW_LABEL, RECEIVER_VIEW_LABEL],
+        _twowaycomm_panel_lines(messages),
     )
-    for row, line in enumerate(_communication_panel_lines(message, probe)):
-        draw.text(
-            (16, height + 12 + row * 34),
-            line,
-            fill=(238, 241, 246),
-            font=font,
-        )
-    return np.asarray(canvas)
+
+
+def _render_agent_views(env, camera_specs) -> tuple[np.ndarray, ...]:
+    """Render the named body cameras from the current simulation state."""
+    renderer = env._offline_renderer
+    if renderer is None:
+        raise RuntimeError("camera rendering requires rgb_array mode")
+    frames = []
+    for entity_name, camera_name in camera_specs:
+        renderer.update(env.sim.data, camera=f"{entity_name}/{camera_name}")
+        frames.append(renderer.render().copy())
+    return tuple(frames)
 
 
 def _render_communication_views(env) -> tuple[np.ndarray, np.ndarray]:
-    """Render both named body cameras from the current simulation state."""
     from escape_room.communication.scene import (
         RECEIVER_NAME,
         RECEIVER_CAMERA_NAME,
@@ -188,14 +247,30 @@ def _render_communication_views(env) -> tuple[np.ndarray, np.ndarray]:
         SENDER_CAMERA_NAME,
     )
 
-    renderer = env._offline_renderer
-    if renderer is None:
-        raise RuntimeError("communication camera rendering requires rgb_array mode")
-    renderer.update(env.sim.data, camera=f"{SENDER_NAME}/{SENDER_CAMERA_NAME}")
-    sender = renderer.render().copy()
-    renderer.update(env.sim.data, camera=f"{RECEIVER_NAME}/{RECEIVER_CAMERA_NAME}")
-    receiver = renderer.render().copy()
-    return sender, receiver
+    return _render_agent_views(
+        env,
+        (
+            (SENDER_NAME, SENDER_CAMERA_NAME),
+            (RECEIVER_NAME, RECEIVER_CAMERA_NAME),
+        ),
+    )
+
+
+def _render_twowaycomm_views(env) -> tuple[np.ndarray, np.ndarray]:
+    from escape_room.twowaycomm.scene import (
+        RECEIVER_CAMERA_NAME,
+        RECEIVER_NAME,
+        SENDER_CAMERA_NAME,
+        SENDER_NAME,
+    )
+
+    return _render_agent_views(
+        env,
+        (
+            (SENDER_NAME, SENDER_CAMERA_NAME),
+            (RECEIVER_NAME, RECEIVER_CAMERA_NAME),
+        ),
+    )
 
 
 def heuristic_policy(env):
@@ -251,9 +326,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--task",
-        choices=["escape-room", "communication"],
+        choices=["escape-room", "communication", "twowaycomm"],
         default="escape-room",
         help="scenario to play",
+    )
+    p.add_argument(
+        "--arrow-layout",
+        choices=["front", "scattered"],
+        default="front",
+        help="twowaycomm arrow placement",
     )
     p.add_argument(
         "--policy",
@@ -370,9 +451,10 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("CUDA requested but unavailable; use --device cpu for playback")
     if args.policy == "checkpoint" and not args.ckpt:
         raise SystemExit("--policy checkpoint requires --ckpt")
-    if args.task == "communication" and args.policy == "heuristic":
+    dual_view = args.task in ("communication", "twowaycomm")
+    if dual_view and args.policy == "heuristic":
         raise SystemExit(
-            "communication playback requires --policy checkpoint or --policy random"
+            f"{args.task} playback requires --policy checkpoint or --policy random"
         )
     if args.headless and not args.record:
         print("warning: --headless without --record produces no visual output")
@@ -391,12 +473,35 @@ def main(argv: list[str] | None = None) -> None:
         if architecture:
             runner_cfg.actor.hidden_dims = architecture["hidden_dims"]
             runner_cfg.actor.sender_hidden_dims = architecture["sender_hidden_dims"]
+    elif args.task == "twowaycomm":
+        from escape_room.twowaycomm.env import make_env
+        from escape_room.twowaycomm.env_cfg import twowaycomm_ppo_runner_cfg
+        from escape_room.twowaycomm.evaluate import checkpoint_actor_architecture
+
+        architecture = checkpoint_actor_architecture(args.ckpt) if args.ckpt else None
+        if architecture:
+            runner_cfg = twowaycomm_ppo_runner_cfg(
+                sender_message_dim=architecture["sender_message_dim"],
+                receiver_message_dim=architecture["receiver_message_dim"],
+                channel_mode=architecture["channel_mode"],
+                delayed_message_feedback=architecture["delayed_message_feedback"],
+            )
+            runner_cfg.actor.hidden_dims = architecture["hidden_dims"]
+            runner_cfg.actor.sender_hidden_dims = architecture["sender_hidden_dims"]
+            runner_cfg.actor.sender_message_hidden_dims = architecture[
+                "sender_message_hidden_dims"
+            ]
+            runner_cfg.actor.receiver_message_hidden_dims = architecture[
+                "receiver_message_hidden_dims"
+            ]
+        else:
+            runner_cfg = twowaycomm_ppo_runner_cfg(message_dim=args.message_dim or 2)
     else:
         from escape_room.env import make_env
         from escape_room.env_cfg import escape_room_ppo_runner_cfg
 
         runner_cfg = escape_room_ppo_runner_cfg()
-    env = make_env(
+    env_kwargs = dict(
         num_envs=args.num_envs,
         device=device,
         seed=args.seed,
@@ -405,6 +510,9 @@ def main(argv: list[str] | None = None) -> None:
         viewer_width=args.width,
         viewer_height=args.height,
     )
+    if args.task == "twowaycomm":
+        env_kwargs["arrow_layout"] = args.arrow_layout
+    env = make_env(**env_kwargs)
     if (
         args.task == "escape-room"
         and args.ckpt
@@ -446,12 +554,19 @@ def main(argv: list[str] | None = None) -> None:
         obs = wrapped.get_observations()
         writer = None
         if args.record:
-            width = args.width * 2 if args.task == "communication" else args.width
-            height = (
-                args.height + COMMUNICATION_PANEL_HEIGHT
-                if args.task == "communication"
-                else args.height
-            )
+            width = args.width * 2 if dual_view else args.width
+            height = args.height
+            if dual_view:
+                probe_lines = (
+                    _communication_panel_lines(None, None)
+                    if args.task == "communication"
+                    else _twowaycomm_panel_lines(None)
+                )
+                height += (
+                    COMMUNICATION_PANEL_HEIGHT
+                    if args.task == "communication"
+                    else max(COMMUNICATION_PANEL_HEIGHT, 24 + 34 * len(probe_lines))
+                )
             writer = FFmpegVideoWriter(
                 Path(args.record), width, height, args.fps
             )
@@ -460,10 +575,19 @@ def main(argv: list[str] | None = None) -> None:
                 with torch.inference_mode():
                     action = policy(obs)
                     message = None
+                    messages = None
                     if args.task == "communication" and hasattr(
                         policy, "last_message"
                     ):
                         message = policy.last_message[0].cpu().numpy()
+                    elif args.task == "twowaycomm" and hasattr(
+                        policy, "last_messages"
+                    ):
+                        messages = {
+                            channel: value[0].cpu().numpy()
+                            for channel, value in policy.last_messages.items()
+                            if value.numel()
+                        }
                 if writer is not None and args.task == "communication":
                     sender_frame, receiver_frame = _render_communication_views(env)
                     writer.write(
@@ -474,9 +598,16 @@ def main(argv: list[str] | None = None) -> None:
                             message_probe,
                         )
                     )
+                elif writer is not None and args.task == "twowaycomm":
+                    sender_frame, receiver_frame = _render_twowaycomm_views(env)
+                    writer.write(
+                        _compose_twowaycomm_frame(
+                            sender_frame, receiver_frame, messages
+                        )
+                    )
                 with torch.inference_mode():
                     obs, _, _, _ = wrapped.step(action)
-                if writer is not None and args.task != "communication":
+                if writer is not None and not dual_view:
                     writer.write(env.render())
         finally:
             if writer is not None:
