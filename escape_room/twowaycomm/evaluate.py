@@ -20,21 +20,54 @@ from escape_room.twowaycomm.action import LEFT, RIGHT, twowaycomm_term
 from escape_room.twowaycomm.scene import COLOR_NAMES, NUM_COLORS
 
 Intervention = Literal["normal", "zero", "shuffled"]
+# Where an intervention applies to a channel's message:
+#   "all"      - everywhere the partner reads it: its action head AND, in the
+#                delayed channel with feedback, its message encoder.
+#   "head"     - only the partner's action head.
+#   "feedback" - only the partner's message encoder (delayed + feedback only).
+# A query->response protocol travels through "feedback": the receiver's message
+# changes what the sender SAYS, not what the sender does, and the sender's own
+# actions never affect the reward. A head-only ablation of the receiver channel
+# therefore reads zero by construction, whatever the protocol.
+InterventionPath = Literal["all", "head", "feedback"]
+ChannelPlan = tuple[Intervention, InterventionPath]
 Probe = dict[str, Any]
 
 NUM_ARROWS = NUM_COLORS
 NUM_CONDITIONS = (2**NUM_ARROWS) * NUM_COLORS  # 8 arrow patterns x 3 door colours
 DEFAULT_EPISODES = 4800  # 200 per condition; 4096 does not divide by 24
 
-# (sender channel, receiver channel)
-ABLATION_ARMS: dict[str, tuple[Intervention, Intervention]] = {
-    "normal": ("normal", "normal"),
-    "zero_sender": ("zero", "normal"),
-    "zero_receiver": ("normal", "zero"),
-    "zero_both": ("zero", "zero"),
-    "shuffle_sender": ("shuffled", "normal"),
-    "shuffle_receiver": ("normal", "shuffled"),
+_INTACT: ChannelPlan = ("normal", "all")
+# (sender channel, receiver channel). Unsuffixed arms cut every path.
+ABLATION_ARMS: dict[str, tuple[ChannelPlan, ChannelPlan]] = {
+    "normal": (_INTACT, _INTACT),
+    "zero_sender": (("zero", "all"), _INTACT),
+    "zero_receiver": (_INTACT, ("zero", "all")),
+    "zero_both": (("zero", "all"), ("zero", "all")),
+    "shuffle_sender": (("shuffled", "all"), _INTACT),
+    "shuffle_receiver": (_INTACT, ("shuffled", "all")),
+    # Path decomposition. Before the "all" arms existed, zero_receiver meant
+    # zero_receiver_head_only, which is why it always read no effect.
+    "shuffle_sender_head_only": (("shuffled", "head"), _INTACT),
+    "shuffle_receiver_head_only": (_INTACT, ("shuffled", "head")),
+    "shuffle_sender_feedback_only": (("shuffled", "feedback"), _INTACT),
+    "shuffle_receiver_feedback_only": (_INTACT, ("shuffled", "feedback")),
 }
+FEEDBACK_ARMS = frozenset(
+    arm for arm, plans in ABLATION_ARMS.items() if any(p[1] == "feedback" for p in plans)
+)
+
+
+def ablation_arms(has_feedback: bool) -> dict[str, tuple[ChannelPlan, ChannelPlan]]:
+    """Arms that are meaningful for this actor.
+
+    Without a feedback path (same-step, or delayed with feedback disabled) the
+    feedback-only arms would be identical to ``normal``, and ``all`` reduces
+    to ``head``.
+    """
+    if has_feedback:
+        return dict(ABLATION_ARMS)
+    return {arm: plans for arm, plans in ABLATION_ARMS.items() if arm not in FEEDBACK_ARMS}
 
 
 @dataclass
@@ -50,7 +83,7 @@ class Conditions:
 
     @property
     def condition_id(self) -> torch.Tensor:
-        bits = ((self.directions == RIGHT).long() * (2 ** torch.arange(NUM_ARROWS))).sum(
+        bits = ((self.directions == RIGHT).long() * (2 ** torch.arange(NUM_ARROWS, device=self.directions.device))).sum(
             -1
         )
         return self.colors * (2**NUM_ARROWS) + bits
@@ -165,15 +198,36 @@ def evaluate_probe(
 # Interventions.
 
 
+def derangement(
+    count: int, generator: torch.Generator | None = None, device=None
+) -> torch.Tensor:
+    """A permutation that moves every index (falls back to a roll by one)."""
+    if count < 2:
+        raise ValueError("shuffling needs at least two worlds")
+    identity = torch.arange(count, device=device)
+    for _ in range(32):
+        source = generator.device if generator is not None else "cpu"
+        permutation = torch.randperm(count, generator=generator, device=source).to(device)
+        if torch.all(permutation != identity):
+            return permutation
+    return torch.roll(identity, 1)
+
+
 def apply_message_intervention(
     messages: torch.Tensor,
     intervention: Intervention,
     generator: torch.Generator | None = None,
+    permutation: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """``permutation`` fixes which world a shuffled message comes from; the
+    rollout passes one per channel so a world hears one consistent stranger
+    for the whole episode instead of a different one every step."""
     if intervention == "normal":
         return messages
     if intervention == "zero":
         return torch.zeros_like(messages)
+    if intervention == "shuffled" and permutation is not None:
+        return messages[permutation]
     if intervention == "shuffled":
         count = messages.shape[0]
         if count < 2:
@@ -217,6 +271,20 @@ _ENCODER_PREFIXES = (
 )
 
 
+def channel_effects(results: dict[str, dict[str, Any]]) -> dict[str, float]:
+    """Accuracy lost when each channel is replaced by a stranger's message."""
+    normal = results["normal"]["correct_rate"]
+    effects = {}
+    for channel, label in (("sender", "forward"), ("receiver", "back")):
+        for suffix in ("", "_head_only", "_feedback_only"):
+            arm = f"shuffle_{channel}{suffix}"
+            if arm in results:
+                effects[f"{label}_channel_effect{suffix}"] = (
+                    normal - results[arm]["correct_rate"]
+                )
+    return effects
+
+
 def checkpoint_actor_architecture(path: str | Path) -> dict[str, Any]:
     """Infer the actor's widths and channel mode so strict loading succeeds.
 
@@ -226,6 +294,14 @@ def checkpoint_actor_architecture(path: str | Path) -> dict[str, Any]:
     """
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     state = checkpoint.get("actor_state_dict", {})
+    metadata = (checkpoint.get("infos") or {}).get("twowaycomm", {})
+    has_pixels = any(key.startswith("sender_cnn.") for key in state)
+    if has_pixels and not metadata:
+        sidecar = Path(path).parent / "training_config.json"
+        if sidecar.exists():
+            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+        else:
+            raise ValueError("pixel checkpoint requires saved image-size metadata")
     layers: dict[str, list[tuple[int, torch.Tensor]]] = {
         prefix: [] for prefix in _ENCODER_PREFIXES
     }
@@ -244,11 +320,17 @@ def checkpoint_actor_architecture(path: str | Path) -> dict[str, Any]:
         entries.sort(key=lambda item: item[0])
 
     code = int(state.get("channel_mode_code", torch.tensor(0)).reshape(-1)[0])
-    from escape_room.twowaycomm.model import CHANNEL_MODES
+    # Absent from checkpoints that predate the DRU, all of which are tanh.
+    unit_code = int(state.get("message_unit_code", torch.tensor(0)).reshape(-1)[0])
+    from escape_room.twowaycomm.model import CHANNEL_MODES, MESSAGE_UNITS
 
     sender_message_in = int(layers["sender_message_encoder"][0][1].shape[1])
     sender_obs_dim = int(layers["sender_latent_encoder"][0][1].shape[1])
     return {
+        "obs_mode": "pixel" if has_pixels else "vector",
+        "environment": metadata.get("environment", {"obs_mode": "vector", "arrow_layout": "front"}),
+        "cnn_cfg": metadata.get("runner", {}).get("actor", {}).get("cnn_cfg"),
+        "critic_obs_mode": metadata.get("cli_args", {}).get("critic_obs_mode"),
         "sender_message_dim": int(layers["sender_message_encoder"][-1][1].shape[0]),
         "receiver_message_dim": int(layers["receiver_message_encoder"][-1][1].shape[0]),
         "sender_message_hidden_dims": tuple(
@@ -264,6 +346,7 @@ def checkpoint_actor_architecture(path: str | Path) -> dict[str, Any]:
             int(value.shape[0]) for _, value in layers["receiver_latent_encoder"]
         ),
         "channel_mode": CHANNEL_MODES[code],
+        "message_unit": MESSAGE_UNITS[unit_code],
         # With feedback the message encoder reads the partner message too, so
         # its input is wider than the latent encoder's by exactly that width.
         "delayed_message_feedback": sender_message_in > sender_obs_dim,
@@ -308,15 +391,38 @@ class RolloutData:
         }
 
 
+def route_messages(
+    emitted: tuple[torch.Tensor, torch.Tensor],
+    plans: tuple[ChannelPlan, ChannelPlan],
+    permutations: tuple[torch.Tensor | None, torch.Tensor | None] = (None, None),
+    generator: torch.Generator | None = None,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    """Return ``(to_encoders, to_heads)``: what each partner's message encoder
+    (feedback) and action head receive, given the per-channel ablation plans.
+
+    The intervention is applied once per channel, so an ``all`` plan feeds the
+    same altered message to both paths.
+    """
+    to_encoders, to_heads = [], []
+    for message, (intervention, path), permutation in zip(emitted, plans, permutations):
+        altered = apply_message_intervention(message, intervention, generator, permutation)
+        to_heads.append(altered if path in ("all", "head") else message)
+        to_encoders.append(altered if path in ("all", "feedback") else message)
+    return (to_encoders[0], to_encoders[1]), (to_heads[0], to_heads[1])
+
+
 def run_balanced_rollout(
     wrapped_env,
     actor,
     conditions: Conditions,
-    plan: tuple[Intervention, Intervention] = ("normal", "normal"),
+    plan: tuple[ChannelPlan, ChannelPlan] = (_INTACT, _INTACT),
     generator: torch.Generator | None = None,
     capture_steps: int = 3,
 ) -> RolloutData:
-    """One episode per world under a fixed condition set and ablation plan."""
+    """One episode per world under a fixed condition set and ablation plan.
+
+    The logged messages are what each agent emitted, before any intervention.
+    """
     env = wrapped_env.unwrapped
     device = env.device
     wrapped_env.reset()
@@ -324,6 +430,7 @@ def run_balanced_rollout(
     term.set_arrow_directions(conditions.directions)
     term.set_door_color(conditions.colors)
     env.sim.forward()
+    env.sim.sense()
     obs = env.observation_manager.compute(update_history=True)
     actor.reset()
 
@@ -332,10 +439,19 @@ def run_balanced_rollout(
     receiver_width = actor.receiver_message_dim
     sender_log = torch.zeros(worlds, capture_steps, sender_width)
     receiver_log = torch.zeros(worlds, capture_steps, receiver_width)
-    previous = (
+    # One fixed stranger per channel for the whole episode.
+    permutations = tuple(
+        derangement(worlds, generator, device) if channel[0] == "shuffled" else None
+        for channel in plan
+    )
+    zeros = (
         torch.zeros(worlds, sender_width, device=device),
         torch.zeros(worlds, receiver_width, device=device),
     )
+    # Delayed channel: what the encoders (feedback) and heads read at step t
+    # is what was routed at t-1.
+    heard_by_encoders = zeros
+    heard_by_heads = zeros
     correct = torch.zeros(worlds, dtype=torch.bool, device=device)
     wrong = torch.zeros_like(correct)
     timeout = torch.zeros_like(correct)
@@ -343,26 +459,21 @@ def run_balanced_rollout(
 
     with torch.inference_mode():
         for step in range(int(env.max_episode_length)):
-            sender_message, receiver_message = actor.encode_messages(obs, previous)
+            sender_message, receiver_message = actor.encode_messages(
+                obs, heard_by_encoders
+            )
             if step < capture_steps:
                 sender_log[:, step] = sender_message.detach().cpu()
                 receiver_log[:, step] = receiver_message.detach().cpu()
-            if actor.is_recurrent:
-                delivered = (previous[0], previous[1])
-            else:
-                delivered = (sender_message, receiver_message)
-            # Intervene on what is delivered, never on what is remembered.
-            delivered_sender = apply_message_intervention(
-                delivered[0], plan[0], generator
+            to_encoders, to_heads = route_messages(
+                (sender_message, receiver_message), plan, permutations, generator
             )
-            delivered_receiver = apply_message_intervention(
-                delivered[1], plan[1], generator
-            )
-            actions = actor.action_from_messages(
-                obs, delivered_sender, delivered_receiver
-            )
+            # Same-step heads read this step's messages; delayed heads read last
+            # step's. Same-step encoders never read the partner at all.
+            delivered = heard_by_heads if actor.is_recurrent else to_heads
+            actions = actor.action_from_messages(obs, delivered[0], delivered[1])
             obs, _, dones, _ = wrapped_env.step(actions)
-            previous = (sender_message, receiver_message)
+            heard_by_encoders, heard_by_heads = to_encoders, to_heads
 
             done_mask = dones.bool()
             if torch.any(done_mask & active):
@@ -377,9 +488,11 @@ def run_balanced_rollout(
                 reset_ids = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
                 env.reset(env_ids=reset_ids)
                 zeroed = done_mask[:, None]
-                previous = (
-                    torch.where(zeroed, torch.zeros_like(previous[0]), previous[0]),
-                    torch.where(zeroed, torch.zeros_like(previous[1]), previous[1]),
+                heard_by_encoders = tuple(
+                    torch.where(zeroed, torch.zeros_like(m), m) for m in heard_by_encoders
+                )
+                heard_by_heads = tuple(
+                    torch.where(zeroed, torch.zeros_like(m), m) for m in heard_by_heads
                 )
                 obs = wrapped_env.get_observations()
 
@@ -472,16 +585,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=DEFAULT_EPISODES)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--arrow-layout", choices=["front", "scattered"], default="front")
+    parser.add_argument("--arrow-layout", choices=["front", "scattered"], default=None,
+                        help="default: restore the checkpoint's layout")
+    parser.add_argument("--num-envs", type=int, default=None,
+                        help="evaluation batch size; pixel default 96, vector default episodes")
     parser.add_argument("--calibration-fraction", type=float, default=0.5)
     parser.add_argument("--probe-step", type=int, default=None)
     parser.add_argument("--message-probe", default=None)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--arms", nargs="+", choices=list(ABLATION_ARMS), default=None,
+                        help="optional subset of intervention arms; must include normal")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.arms is not None and "normal" not in args.arms:
+        raise SystemExit("--arms must include normal")
     if args.episodes % NUM_CONDITIONS:
         raise SystemExit(
             f"--episodes must be a multiple of {NUM_CONDITIONS} so every "
@@ -498,11 +618,18 @@ def main(argv: list[str] | None = None) -> None:
     from escape_room.twowaycomm.env_cfg import twowaycomm_ppo_runner_cfg
 
     architecture = checkpoint_actor_architecture(args.ckpt)
+    num_envs = args.num_envs or (min(96, args.episodes) if architecture["obs_mode"] == "pixel" else args.episodes)
+    if num_envs < 24 or args.episodes % num_envs:
+        raise SystemExit("--num-envs must be >=24 and divide --episodes")
     runner_cfg = twowaycomm_ppo_runner_cfg(
+        obs_mode=architecture["obs_mode"],
+        algorithm="mappo" if architecture["obs_mode"] == "pixel" else "ppo",
         sender_message_dim=architecture["sender_message_dim"],
         receiver_message_dim=architecture["receiver_message_dim"],
         channel_mode=architecture["channel_mode"],
         delayed_message_feedback=architecture["delayed_message_feedback"],
+        message_unit=architecture["message_unit"],
+        critic_obs_mode=architecture.get("critic_obs_mode"),
     )
     runner_cfg.actor.hidden_dims = architecture["hidden_dims"]
     runner_cfg.actor.sender_hidden_dims = architecture["sender_hidden_dims"]
@@ -512,12 +639,17 @@ def main(argv: list[str] | None = None) -> None:
     runner_cfg.actor.receiver_message_hidden_dims = architecture[
         "receiver_message_hidden_dims"
     ]
+    if architecture["cnn_cfg"] is not None:
+        runner_cfg.actor.cnn_cfg = architecture["cnn_cfg"]
 
+    env_config = dict(architecture["environment"])
+    if args.arrow_layout is not None:
+        env_config["arrow_layout"] = args.arrow_layout
     env = make_env(
-        num_envs=args.episodes,
+        num_envs=num_envs,
         device=args.device,
         seed=args.seed,
-        arrow_layout=args.arrow_layout,
+        **env_config,
         auto_reset=False,
     )
     try:
@@ -535,10 +667,20 @@ def main(argv: list[str] | None = None) -> None:
         results: dict[str, Any] = {}
         probe: Probe | None = None
         accuracies: dict[str, float] = {}
-        for arm, plan in ABLATION_ARMS.items():
+        has_feedback = actor.is_recurrent and actor.delayed_message_feedback
+        for arm, plan in ablation_arms(has_feedback).items():
+            if args.arms is not None and arm not in args.arms:
+                continue
             generator = torch.Generator(device=args.device).manual_seed(args.seed)
-            rollout = run_balanced_rollout(
-                wrapped, actor, conditions, plan, generator
+            chunks = []
+            for start in range(0, args.episodes, num_envs):
+                batch_conditions = Conditions(conditions.directions[start:start+num_envs],
+                                              conditions.colors[start:start+num_envs])
+                chunks.append(run_balanced_rollout(wrapped, actor, batch_conditions, plan, generator))
+            rollout = RolloutData(
+                **{key: torch.cat([getattr(chunk, key) for chunk in chunks])
+                   for key in ("sender_messages", "receiver_messages", "correct", "wrong", "timeout")},
+                conditions=Conditions(conditions.directions.cpu(), conditions.colors.cpu()),
             )
             results[arm] = rollout.metrics()
             if arm == "normal":
@@ -558,18 +700,22 @@ def main(argv: list[str] | None = None) -> None:
 
     summary = {
         "checkpoint": str(Path(args.ckpt).resolve()),
+        "observation_config": env_config,
+        "evaluation_batch_size": num_envs,
         "channel_mode": architecture["channel_mode"],
+        # A DRU is evaluated with hard bits, so "zero" is a valid all-zeros
+        # message rather than silence; "shuffled" is the cleaner control.
+        "message_unit": architecture["message_unit"],
         "delayed_message_feedback": architecture["delayed_message_feedback"],
         "sender_message_dim": architecture["sender_message_dim"],
         "receiver_message_dim": architecture["receiver_message_dim"],
         "probe_path": str(probe_path.resolve()),
         "held_out_probe_accuracy": accuracies,
         "arms": results,
-        # The headline numbers: how much each channel is worth.
-        "forward_channel_effect": results["normal"]["correct_rate"]
-        - results["zero_sender"]["correct_rate"],
-        "back_channel_effect": results["normal"]["correct_rate"]
-        - results["zero_receiver"]["correct_rate"],
+        # The headline numbers: how much each channel is worth, cut on every
+        # path. Shuffle rather than zero, because for a DRU the all-zeros code
+        # is a valid message, not silence.
+        **channel_effects(results),
     }
     output_path = Path(args.output or Path(args.ckpt).with_suffix(".evaluation.json"))
     output_path.parent.mkdir(parents=True, exist_ok=True)

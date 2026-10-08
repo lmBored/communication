@@ -333,7 +333,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--arrow-layout",
         choices=["front", "scattered"],
-        default="front",
+        default=None,
         help="twowaycomm arrow placement",
     )
     p.add_argument(
@@ -481,10 +481,14 @@ def main(argv: list[str] | None = None) -> None:
         architecture = checkpoint_actor_architecture(args.ckpt) if args.ckpt else None
         if architecture:
             runner_cfg = twowaycomm_ppo_runner_cfg(
+                obs_mode=architecture["obs_mode"],
+                algorithm="mappo" if architecture["obs_mode"] == "pixel" else "ppo",
                 sender_message_dim=architecture["sender_message_dim"],
                 receiver_message_dim=architecture["receiver_message_dim"],
                 channel_mode=architecture["channel_mode"],
                 delayed_message_feedback=architecture["delayed_message_feedback"],
+                message_unit=architecture["message_unit"],
+                critic_obs_mode=architecture.get("critic_obs_mode"),
             )
             runner_cfg.actor.hidden_dims = architecture["hidden_dims"]
             runner_cfg.actor.sender_hidden_dims = architecture["sender_hidden_dims"]
@@ -494,6 +498,8 @@ def main(argv: list[str] | None = None) -> None:
             runner_cfg.actor.receiver_message_hidden_dims = architecture[
                 "receiver_message_hidden_dims"
             ]
+            if architecture["cnn_cfg"] is not None:
+                runner_cfg.actor.cnn_cfg = architecture["cnn_cfg"]
         else:
             runner_cfg = twowaycomm_ppo_runner_cfg(message_dim=args.message_dim or 2)
     else:
@@ -511,7 +517,9 @@ def main(argv: list[str] | None = None) -> None:
         viewer_height=args.height,
     )
     if args.task == "twowaycomm":
-        env_kwargs["arrow_layout"] = args.arrow_layout
+        if architecture:
+            env_kwargs.update(architecture["environment"])
+        env_kwargs["arrow_layout"] = args.arrow_layout or env_kwargs.get("arrow_layout", "front")
     env = make_env(**env_kwargs)
     if (
         args.task == "escape-room"

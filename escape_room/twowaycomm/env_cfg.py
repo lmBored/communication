@@ -63,7 +63,10 @@ DEFAULT_PHYSICS_SUBSTEPS = 1
 DEFAULT_NCONMAX = 48
 DEFAULT_NJMAX = 192
 
-REWARD_SHARING_MODES: tuple[str, ...] = ("shared", "receiver_only")
+# "individual" returns the same scalar as "shared" but credits the sender-shaping
+# bonus to the sender alone in extras["agent_rewards"]; only a learner with
+# per-agent values (MAPPO) can tell the two apart.
+REWARD_SHARING_MODES: tuple[str, ...] = ("shared", "receiver_only", "individual")
 DEFAULT_REWARD_SHARING = "shared"
 OBS_MODES: tuple[str, ...] = ("vector", "pixel")
 DEFAULT_OBS_MODE = "vector"
@@ -80,6 +83,19 @@ DEFAULT_SENDER_CAMERA_HEIGHT = 192
 
 
 @dataclass
+class PixelGruCriticCfg(RslRlModelCfg):
+    class_name: str = "escape_room.twowaycomm.pixel_critic:PixelGruCritic"
+    rnn_type: str = "gru"
+    rnn_hidden_dim: int = 256
+    rnn_num_layers: int = 1
+
+
+@dataclass
+class VectorGruCriticCfg(PixelGruCriticCfg):
+    class_name: str = "escape_room.twowaycomm.pixel_critic:VectorGruCritic"
+
+
+@dataclass
 class TwoWayDialModelCfg(RslRlModelCfg):
     """Actor configuration; the extra fields reach TwoWayDialActor as kwargs."""
 
@@ -91,7 +107,34 @@ class TwoWayDialModelCfg(RslRlModelCfg):
     receiver_message_dim: int | None = None
     channel_mode: str = "same_step"
     delayed_message_feedback: bool = True
-    message_noise_std: float = 0.0
+    message_unit: str = "tanh"
+    # None picks the unit's default: 0 for tanh, DIAL's sigma = 2 for the DRU.
+    message_noise_std: float | None = None
+
+
+ALGORITHMS: tuple[str, ...] = ("ppo", "mappo")
+DEFAULT_ALGORITHM = "ppo"
+
+
+@dataclass
+class MappoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    """MAPPO (escape_room.twowaycomm.mappo.MAPPO); the extra fields are kwargs.
+
+    Defaults follow Yu et al. (2022) -- gradient clip 10, ValueNorm, a Huber
+    value loss -- except the learning rate, which is KL-adaptive rather than
+    fixed (see _algorithm_cfg). ``critic_learning_rate`` and
+    ``critic_max_grad_norm`` fall back to the actor's values when ``None``.
+    """
+
+    class_name: str = "escape_room.twowaycomm.mappo:MAPPO"
+    num_agents: int = 2
+    critic_learning_rate: float | None = None
+    critic_max_grad_norm: float | None = None
+    use_value_norm: bool = True
+    value_loss: str = "huber"
+    huber_delta: float = 10.0
+    # None disables KL early stopping.
+    max_kl: float | None = None
 
 
 def twowaycomm_env_cfg(
@@ -109,6 +152,7 @@ def twowaycomm_env_cfg(
     camera_height: int = DEFAULT_CAMERA_HEIGHT,
     sender_camera_width: int | None = None,
     sender_camera_height: int | None = None,
+    pixel_size: int | None = None,
 ) -> ManagerBasedRlEnvCfg:
     """Build the two-way communication task.
 
@@ -116,10 +160,17 @@ def twowaycomm_env_cfg(
     as the one-way scenario defines it: one scalar per world per step, from
     which both agents' branches are optimized. ``"receiver_only"`` additionally
     forces every sender-originated shaping term off, so nothing but the
-    receiver's door entry can produce reward.
+    receiver's door entry can produce reward. ``"individual"`` returns the same
+    scalar as ``"shared"``, but the per-agent split it publishes in
+    ``extras["agent_rewards"]`` credits the sender-shaping bonus to the sender
+    alone, which only a per-agent learner (MAPPO) can make use of.
     """
     if physics_substeps < 1:
         raise ValueError("physics_substeps must be at least 1")
+    if pixel_size is not None:
+        if pixel_size not in (32, 64, 192):
+            raise ValueError("pixel_size must be 32, 64 or 192")
+        camera_width = camera_height = sender_camera_width = sender_camera_height = pixel_size
     if arrow_layout not in ARROW_LAYOUTS:
         raise ValueError(
             f"unknown arrow layout {arrow_layout!r}; choose from {ARROW_LAYOUTS}"
@@ -143,7 +194,7 @@ def twowaycomm_env_cfg(
     # Off by default, which keeps the reward function identical to the one-way
     # scenario. Turning it on is what makes the sender's own motion matter, and
     # therefore what gives the back-channel something to be useful for.
-    if reward_sharing == "shared" and sender_shaping_weight > 0.0:
+    if reward_sharing in ("shared", "individual") and sender_shaping_weight > 0.0:
         rewards["sender_alignment"] = RewardTermCfg(
             func=sender_alignment_reward_rate, weight=sender_shaping_weight
         )
@@ -176,6 +227,10 @@ def twowaycomm_env_cfg(
                 entity_name=RECEIVER_NAME,
                 arrow_layout=arrow_layout,
                 obs_mode=obs_mode,
+                reward_sharing=reward_sharing,
+                sender_shaping_weight=(
+                    sender_shaping_weight if "sender_alignment" in rewards else 0.0
+                ),
             ),
         },
         # Passing events at all overrides the dataclass default, so the stock
@@ -293,10 +348,25 @@ def twowaycomm_ppo_runner_cfg(
     channel_mode: str = "same_step",
     delayed_message_feedback: bool = True,
     obs_mode: str = DEFAULT_OBS_MODE,
+    algorithm: str = DEFAULT_ALGORITHM,
+    message_unit: str = "tanh",
+    message_noise_std: float | None = None,
+    critic_obs_mode: str | None = None,
 ) -> RslRlOnPolicyRunnerCfg:
-    """Configure the two-way DIAL actor and a centralized critic."""
+    """Configure the two-way DIAL actor and a centralized critic.
+
+    ``algorithm="ppo"`` is rsl-rl PPO (one joint ratio, one team value) with
+    the channel noise recorded for replay; ``"mappo"`` is per-agent clipped PPO
+    with a per-agent centralized critic.
+    """
     if obs_mode not in OBS_MODES:
         raise ValueError(f"unknown obs_mode {obs_mode!r}; choose from {OBS_MODES}")
+    if algorithm not in ALGORITHMS:
+        raise ValueError(f"unknown algorithm {algorithm!r}; choose from {ALGORITHMS}")
+    if critic_obs_mode not in (None, "vector", "pixel"):
+        raise ValueError("critic_obs_mode must be vector, pixel or None")
+    if critic_obs_mode is not None and (obs_mode != "pixel" or algorithm != "mappo"):
+        raise ValueError("explicit critic_obs_mode requires pixel actors and MAPPO")
     actor_groups = ("sender", "receiver")
     cnn_cfg = None
     if obs_mode == "pixel":
@@ -304,6 +374,21 @@ def twowaycomm_ppo_runner_cfg(
 
         actor_groups = ("sender", "receiver", "sender_image", "receiver_image")
         cnn_cfg = dict(DEFAULT_CNN_CFG)
+    critic_cfg = RslRlModelCfg(
+        class_name=("escape_room.twowaycomm.mappo:MultiAgentCritic"
+                    if algorithm == "mappo" else "MLPModel"),
+        hidden_dims=(256, 256, 256), activation="elu", obs_normalization=True,
+    )
+    critic_groups = ("critic",)
+    if obs_mode == "pixel" and algorithm == "mappo":
+        if critic_obs_mode == "vector":
+            critic_cfg = VectorGruCriticCfg(hidden_dims=(256, 256, 256),
+                                            activation="elu", obs_normalization=True)
+        else:
+            critic_cfg = PixelGruCriticCfg(hidden_dims=(256, 256, 256),
+                                          activation="elu", obs_normalization=True,
+                                          cnn_cfg=dict(cnn_cfg))
+            critic_groups = actor_groups
     return RslRlOnPolicyRunnerCfg(
         actor=TwoWayDialModelCfg(
             class_name="escape_room.twowaycomm.model:TwoWayDialActor",
@@ -323,34 +408,57 @@ def twowaycomm_ppo_runner_cfg(
             receiver_message_dim=receiver_message_dim,
             channel_mode=channel_mode,
             delayed_message_feedback=delayed_message_feedback,
+            message_unit=message_unit,
+            message_noise_std=message_noise_std,
             cnn_cfg=cnn_cfg,
         ),
-        critic=RslRlModelCfg(
-            class_name="MLPModel",
-            hidden_dims=(256, 256, 256),
-            activation="elu",
-            obs_normalization=True,
-        ),
-        algorithm=RslRlPpoAlgorithmCfg(
-            num_learning_epochs=5,
-            num_mini_batches=4,
-            learning_rate=3.0e-4,
-            schedule="adaptive",
-            gamma=0.99,
-            lam=0.95,
-            entropy_coef=0.005,
-            desired_kl=0.01,
-        ),
+        critic=critic_cfg,
+        algorithm=_algorithm_cfg(algorithm),
         experiment_name="twowaycomm",
         logger="tensorboard",
         obs_groups={
             "actor": actor_groups,
-            "critic": ("critic",),
+            "critic": critic_groups,
         },
         clip_actions=1.0,
         num_steps_per_env=16,
         max_iterations=1000,
         save_interval=50,
+    )
+
+
+def _algorithm_cfg(algorithm: str) -> RslRlPpoAlgorithmCfg:
+    if algorithm == "mappo":
+        return MappoAlgorithmCfg(
+            num_learning_epochs=5,
+            num_mini_batches=4,
+            learning_rate=3.0e-4,
+            # Adaptive, not the paper's fixed rate. Measured on tanh + delayed +
+            # front, 3 seeds x 1000 updates (W&B group stability-tanh-delayed):
+            # fixed 3e-4 ended at 0.917/0.792/0.792 (one collapse after reaching
+            # 1.0 from a KL spike of 0.22, two stalls at 19/24 conditions);
+            # fixed + max_kl 0.02 at 0.792/0.958/0.748; adaptive at 1.000 x 3.
+            # Adaptive raises the rate to ~1e-2 early, which escapes the stall,
+            # and lowers it to 3e-5..3e-4 late, which prevents the collapse.
+            schedule="adaptive",
+            gamma=0.99,
+            lam=0.95,
+            entropy_coef=0.005,
+            desired_kl=0.01,
+            max_grad_norm=10.0,
+            value_loss_coef=1.0,
+        )
+    return RslRlPpoAlgorithmCfg(
+        # Numerically identical to rsl-rl PPO unless the channel is noisy.
+        class_name="escape_room.twowaycomm.mappo:DialPPO",
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=3.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        entropy_coef=0.005,
+        desired_kl=0.01,
     )
 
 

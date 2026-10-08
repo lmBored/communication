@@ -20,6 +20,30 @@ Two channel modes are supported:
     that colour's arrow direction at ``t+1``. The pair of messages is carried as
     the model's recurrent hidden state so rsl-rl stores and replays it with
     trajectory-aligned minibatches.
+
+Two message units are supported:
+
+``tanh``
+    A continuous ``tanh`` channel, identical in training and execution.
+
+``dru``
+    DIAL's discretise/regularise unit (Foerster et al., 2016). Training emits
+    ``sigmoid(m + sigma * eps)``; the noise pushes the encoder towards saturated
+    logits, so that execution can emit the hard bit ``1{m > 0}`` without
+    changing what the partner receives.
+
+``dru_st``
+    A straight-through DRU. Training already emits the hard bit
+    ``1{m + sigma * eps > 0}``, so the partner trains on exactly what it will
+    receive at execution, and the backward pass uses the sigmoid's gradient.
+    Nothing rewards saturated logits, which keeps that gradient alive; the
+    plain DRU's saturation is what freezes its code early.
+
+Training noise ``eps`` is part of the policy input. An algorithm that wants a
+correct PPO ratio samples it once per step and supplies it under
+``MESSAGE_NOISE_KEY`` in the observation TensorDict, so the rollout storage
+records it and the update replays exactly the same draw. Without the key the
+actor samples fresh noise itself.
 """
 
 from __future__ import annotations
@@ -47,6 +71,18 @@ DEFAULT_CNN_CFG: dict[str, object] = {
 
 CHANNEL_MODES: tuple[str, ...] = ("same_step", "delayed")
 _CHANNEL_MODE_CODES = {mode: index for index, mode in enumerate(CHANNEL_MODES)}
+MESSAGE_UNITS: tuple[str, ...] = ("tanh", "dru", "dru_st")
+DISCRETE_MESSAGE_UNITS = frozenset({"dru", "dru_st"})
+_MESSAGE_UNIT_CODES = {unit: index for index, unit in enumerate(MESSAGE_UNITS)}
+# DIAL's training noise for the DRU; the paper uses sigma = 2. The tanh unit
+# defaults to no noise, which is the behaviour every existing checkpoint has.
+DEFAULT_DRU_NOISE_STD = 2.0
+MESSAGE_NOISE_KEY = "message_noise"
+
+
+def default_message_noise_std(message_unit: str) -> float:
+    # The straight-through unit needs no noise to binarize; it is optional.
+    return DEFAULT_DRU_NOISE_STD if message_unit == "dru" else 0.0
 
 
 def _encode_image(cnn: CNN, image: torch.Tensor) -> torch.Tensor:
@@ -105,7 +141,8 @@ class TwoWayDialActor(nn.Module):
         receiver_message_dim: int | None = None,
         channel_mode: str = "same_step",
         delayed_message_feedback: bool = True,
-        message_noise_std: float = 0.0,
+        message_unit: str = "tanh",
+        message_noise_std: float | None = None,
         cnn_cfg: dict | None = None,
     ) -> None:
         super().__init__()
@@ -124,6 +161,14 @@ class TwoWayDialActor(nn.Module):
             raise ValueError(
                 f"unknown channel_mode {channel_mode!r}; use one of {CHANNEL_MODES}"
             )
+        if message_unit not in MESSAGE_UNITS:
+            raise ValueError(
+                f"unknown message_unit {message_unit!r}; use one of {MESSAGE_UNITS}"
+            )
+        if message_noise_std is None:
+            message_noise_std = default_message_noise_std(message_unit)
+        if message_noise_std < 0.0:
+            raise ValueError("message_noise_std must be non-negative")
         if not all(
             (
                 hidden_dims,
@@ -167,7 +212,8 @@ class TwoWayDialActor(nn.Module):
         self.obs_normalization = obs_normalization
         self.channel_mode = channel_mode
         self.delayed_message_feedback = delayed_message_feedback
-        self.message_noise_std = message_noise_std
+        self.message_unit = message_unit
+        self.message_noise_std = float(message_noise_std)
         # Instance attribute shadows the class default; PPO reads it off the
         # constructed actor to pick the recurrent rollout storage.
         self.is_recurrent = channel_mode == "delayed"
@@ -265,6 +311,13 @@ class TwoWayDialActor(nn.Module):
             torch.tensor(_CHANNEL_MODE_CODES[channel_mode], dtype=torch.long),
             persistent=True,
         )
+        # Same reason: tanh and DRU checkpoints have identical parameter shapes,
+        # and the unit decides what the partner heads were trained to read.
+        self.register_buffer(
+            "message_unit_code",
+            torch.tensor(_MESSAGE_UNIT_CODES[message_unit], dtype=torch.long),
+            persistent=True,
+        )
         # Sized from the constructor observations because PPO records
         # get_hidden_state() *before* the first forward, and the rollout storage
         # allocates its buffers from whatever shape that first record has.
@@ -299,6 +352,21 @@ class TwoWayDialActor(nn.Module):
     def last_receiver_message(self) -> torch.Tensor:
         """Message most recently emitted by the receiver, detached."""
         return self._last_receiver_message
+
+    @property
+    def last_message_logits(self) -> dict[str, torch.Tensor]:
+        """Pre-unit encoder outputs from the latest encode, detached."""
+        logits = getattr(self, "_last_logits", None)
+        if logits is None:
+            return {}
+        return {"sender": logits[0], "receiver": logits[1]}
+
+    @property
+    def message_noise_dim(self) -> int:
+        """Width of the noise an algorithm should record per step (0 = none)."""
+        if self.message_noise_std == 0.0:
+            return 0
+        return self.sender_message_dim + self.receiver_message_dim
 
     @property
     def last_messages(self) -> dict[str, torch.Tensor]:
@@ -350,10 +418,39 @@ class TwoWayDialActor(nn.Module):
             return obs[0], obs[1]
         return obs["sender"], obs["receiver"]
 
-    def _bound(self, raw: torch.Tensor) -> torch.Tensor:
-        if self.training and self.message_noise_std > 0.0:
-            raw = raw + torch.randn_like(raw) * self.message_noise_std
+    def _bound(
+        self, raw: torch.Tensor, noise: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Apply the message unit: noisy and smooth in training, clean in eval."""
+        if not self.training:
+            if self.message_unit in DISCRETE_MESSAGE_UNITS:
+                return (raw > 0.0).to(raw.dtype)
+            return torch.tanh(raw)
+        if self.message_noise_std > 0.0:
+            if noise is None:
+                noise = torch.randn_like(raw)
+            raw = raw + noise * self.message_noise_std
+        if self.message_unit == "dru":
+            return torch.sigmoid(raw)
+        if self.message_unit == "dru_st":
+            soft = torch.sigmoid(raw)
+            hard = (raw > 0.0).to(raw.dtype)
+            # Forward value: exactly the hard bit (the bracket is exactly zero).
+            # Gradient: the sigmoid's.
+            return hard + (soft - soft.detach())
         return torch.tanh(raw)
+
+    def _message_noise(
+        self, obs: TensorDict | tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Recorded standard-normal draws, split per channel, if supplied."""
+        if isinstance(obs, (tuple, list)) or MESSAGE_NOISE_KEY not in obs.keys():
+            return None, None
+        noise = obs[MESSAGE_NOISE_KEY]
+        return (
+            noise[..., : self.sender_message_dim],
+            noise[..., self.sender_message_dim :],
+        )
 
     def encode_messages(
         self,
@@ -366,6 +463,7 @@ class TwoWayDialActor(nn.Module):
         channel is delayed with feedback enabled.
         """
         sender, receiver = self._features(obs)
+        sender_noise, receiver_noise = self._message_noise(obs)
         if self._feedback:
             if prev is None:
                 raise ValueError(
@@ -374,9 +472,12 @@ class TwoWayDialActor(nn.Module):
             # Each agent hears what its partner said, not what it said itself.
             sender = torch.cat((sender, prev[1]), dim=-1)
             receiver = torch.cat((receiver, prev[0]), dim=-1)
+        sender_logits = self.sender_message_encoder(sender)
+        receiver_logits = self.receiver_message_encoder(receiver)
+        self._last_logits = (sender_logits.detach(), receiver_logits.detach())
         return (
-            self._bound(self.sender_message_encoder(sender)),
-            self._bound(self.receiver_message_encoder(receiver)),
+            self._bound(sender_logits, sender_noise),
+            self._bound(receiver_logits, receiver_noise),
         )
 
     def _head_inputs(
@@ -624,6 +725,20 @@ class TwoWayDialActor(nn.Module):
         unexpected_keys,
         error_msgs,
     ) -> None:
+        unit_key = prefix + "message_unit_code"
+        if unit_key not in state_dict:
+            # Checkpoints from before the DRU existed were all tanh.
+            state_dict[unit_key] = torch.tensor(
+                _MESSAGE_UNIT_CODES["tanh"], dtype=torch.long
+            )
+        stored_unit = int(state_dict[unit_key].reshape(-1)[0].item())
+        current_unit = int(self.message_unit_code.item())
+        if stored_unit != current_unit:
+            error_msgs.append(
+                f"message_unit mismatch: checkpoint was trained with "
+                f"{MESSAGE_UNITS[stored_unit]!r} but this actor was built with "
+                f"{MESSAGE_UNITS[current_unit]!r}"
+            )
         key = prefix + "channel_mode_code"
         if key in state_dict:
             stored = int(state_dict[key].reshape(-1)[0].item())
@@ -681,12 +796,19 @@ class _TwoWayDialExportBase(nn.Module):
         self.receiver_latent_encoder = copy.deepcopy(actor.receiver_latent_encoder)
         self.sender_head = copy.deepcopy(actor.sender_head)
         self.receiver_head = copy.deepcopy(actor.receiver_head)
+        # Exports are execution-time policies, so a DRU emits hard bits.
+        self.discrete_messages = actor.message_unit in DISCRETE_MESSAGE_UNITS
         if actor.distribution is not None:
             self.deterministic_output = (
                 actor.distribution.as_deterministic_output_module()
             )
         else:
             self.deterministic_output = nn.Identity()
+
+    def _emit(self, raw: torch.Tensor) -> torch.Tensor:
+        if self.discrete_messages:
+            return (raw > 0.0).to(raw.dtype)
+        return torch.tanh(raw)
 
     def _heads(
         self,
@@ -710,8 +832,8 @@ class _TwoWayDialExport(_TwoWayDialExportBase):
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         sender = self.sender_normalizer(observations[:, : self.sender_dim])
         receiver = self.receiver_normalizer(observations[:, self.sender_dim :])
-        sender_message = torch.tanh(self.sender_message_encoder(sender))
-        receiver_message = torch.tanh(self.receiver_message_encoder(receiver))
+        sender_message = self._emit(self.sender_message_encoder(sender))
+        receiver_message = self._emit(self.receiver_message_encoder(receiver))
         return self.deterministic_output(
             self._heads(sender, receiver, sender_message, receiver_message)
         )
@@ -745,8 +867,8 @@ class _TwoWayDialDelayedExport(_TwoWayDialExportBase):
         else:
             sender_input = sender
             receiver_input = receiver
-        sender_message = torch.tanh(self.sender_message_encoder(sender_input))
-        receiver_message = torch.tanh(self.receiver_message_encoder(receiver_input))
+        sender_message = self._emit(self.sender_message_encoder(sender_input))
+        receiver_message = self._emit(self.receiver_message_encoder(receiver_input))
         output = self._heads(sender, receiver, prev_sender, prev_receiver)
         self.prev_sender_message[:] = sender_message
         self.prev_receiver_message[:] = receiver_message
@@ -803,8 +925,8 @@ class _TwoWayDialDelayedOnnxExport(_TwoWayDialExportBase):
         else:
             sender_input = sender
             receiver_input = receiver
-        sender_message = torch.tanh(self.sender_message_encoder(sender_input))
-        receiver_message = torch.tanh(self.receiver_message_encoder(receiver_input))
+        sender_message = self._emit(self.sender_message_encoder(sender_input))
+        receiver_message = self._emit(self.receiver_message_encoder(receiver_input))
         actions = self.deterministic_output(
             self._heads(
                 sender, receiver, prev_sender_message, prev_receiver_message

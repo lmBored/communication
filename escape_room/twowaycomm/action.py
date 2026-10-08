@@ -82,6 +82,9 @@ class TwoWayCommActionCfg(ActionTermCfg):
     max_yaw_rate: float = 4.0
     arrow_layout: str = DEFAULT_ARROW_LAYOUT
     obs_mode: str = "vector"
+    # How agent_rewards() splits the team reward; see env_cfg.REWARD_SHARING_MODES.
+    reward_sharing: str = "shared"
+    sender_shaping_weight: float = 0.0
     sender_name: str = SENDER_NAME
     receiver_name: str = RECEIVER_NAME
 
@@ -169,6 +172,9 @@ class TwoWayCommAction(ActionTerm):
         )
         self.wrong_entry = torch.zeros_like(self.correct_entry)
         self.timeout = torch.zeros_like(self.correct_entry)
+        # Cached by the shaping reward term so the per-agent split can remove
+        # exactly what the sender earned this step; stays zero when unused.
+        self.last_sender_alignment = torch.zeros(self.num_envs, device=self.device)
 
         self._write_spawn_poses(self._env_ids)
         self._write_signs(self._env_ids)
@@ -361,6 +367,22 @@ class TwoWayCommAction(ActionTerm):
         delta = target - pose[:, :2]
         distance = torch.linalg.vector_norm(delta, dim=-1).clamp_min(1.0e-6)
         return ((delta / distance[:, None]) * forward).sum(-1).clamp_min(0.0)
+
+    def agent_rewards(self, team_reward: torch.Tensor) -> torch.Tensor:
+        """Split this step's scalar reward into ``[num_envs, 2]`` (sender, receiver).
+
+        ``shared``/``receiver_only``: both agents get the team reward.
+        ``individual``: the outcome stays shared, but the sender-shaping bonus
+        is credited to the sender alone. The scalar reward the environment
+        returns is the same in every mode; only this split differs.
+        """
+        rewards = team_reward.reshape(-1, 1).repeat(1, 2)
+        if self.cfg.reward_sharing == "individual":
+            # The shaping term contributes rate * weight * dt = weight * alignment.
+            rewards[:, RECEIVER_INDEX] -= (
+                self.cfg.sender_shaping_weight * self.last_sender_alignment
+            )
+        return rewards
 
     # Control.
 
@@ -588,7 +610,11 @@ def wrong_reward_rate(env) -> torch.Tensor:
 
 
 def sender_alignment_reward_rate(env) -> torch.Tensor:
-    return twowaycomm_term(env).sender_alignment() / env.step_dt
+    term = twowaycomm_term(env)
+    # Called by the reward manager before any auto-reset, so this is the
+    # terminal-state value that actually entered this step's reward.
+    term.last_sender_alignment = term.sender_alignment()
+    return term.last_sender_alignment / env.step_dt
 
 
 def timeout_reward_rate(env) -> torch.Tensor:

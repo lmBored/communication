@@ -1,6 +1,9 @@
 """Construction and registration for the two-way communication environment."""
 
+import torch
 from mjlab.envs import ManagerBasedRlEnv
+
+from escape_room.twowaycomm.action import twowaycomm_term
 
 from escape_room.twowaycomm.env_cfg import (
     DEFAULT_ARROW_LAYOUT,
@@ -20,6 +23,17 @@ from escape_room.twowaycomm.env_cfg import (
 
 class TwoWayCommRlEnv(ManagerBasedRlEnv):
     """Independent two-agent bidirectional communication task."""
+
+    def step(self, action: torch.Tensor):
+        """Step, and publish the per-agent reward split for multi-agent learners.
+
+        ``extras["agent_rewards"]`` is ``[num_envs, 2]`` (sender, receiver);
+        ``RslRlVecEnvWrapper`` passes extras through untouched, and learners
+        that do not read it see the usual scalar reward.
+        """
+        obs, reward, terminated, truncated, extras = super().step(action)
+        extras["agent_rewards"] = twowaycomm_term(self).agent_rewards(reward)
+        return obs, reward, terminated, truncated, extras
 
 
 def make_env(
@@ -41,6 +55,7 @@ def make_env(
     camera_height: int = DEFAULT_CAMERA_HEIGHT,
     sender_camera_width: int | None = None,
     sender_camera_height: int | None = None,
+    pixel_size: int | None = None,
     auto_reset: bool = True,
 ) -> TwoWayCommRlEnv:
     """Construct the two-way communication scenario.
@@ -63,6 +78,7 @@ def make_env(
         camera_height=camera_height,
         sender_camera_width=sender_camera_width,
         sender_camera_height=sender_camera_height,
+        pixel_size=pixel_size,
     )
     cfg.auto_reset = auto_reset
     if viewer_width is not None:
